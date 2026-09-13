@@ -61,6 +61,10 @@ def test_auto_can_be_disabled_and_live_controls_apply():
         i=c.findData('最大值');c.setCurrentIndex(i);c.activated.emit(i);pump(app,lambda:w.latest['mode']=='最大值' and w.latest['effective_mode']=='最大值')
         d=w.controls['denoise_mode'];d.setCurrentIndex(d.findData('中值 3×3（去孤立噪点）'));d.activated.emit(d.currentIndex())
         w.controls['denoise_amount'].slider.setValue(3000);pump(app,lambda:w.worker.settings['denoise_mode'].startswith('中值') and w.worker.settings['denoise_amount']>29)
+        low=w.controls['lowlight_mode'];low.setCurrentIndex(low.findData('星点/流星保护'));low.activated.emit(low.currentIndex())
+        w.controls['lowlight_strength'].slider.setValue(6500);pump(app,lambda:w.worker.settings['lowlight_mode']=='星点/流星保护' and w.worker.settings['lowlight_strength']>64)
+        pump(app,lambda:w.latest['lowlight_mode']=='星点/流星保护')
+        assert w.latest['lowlight_mode']=='星点/流星保护'
         c=w.controls['resolution'];c.setCurrentIndex(1);c.activated.emit(1)
         pump(app,lambda:w.latest['shape']==(960,1280))
         assert not w.worker.settings['auto']

@@ -9,6 +9,7 @@ REF_OPS={'减去参考帧','加上参考帧','与参考帧平均'}
 MATH_OPS=['关闭','加常数','乘系数','窗口平均','窗口积分','减去窗口平均','加上窗口平均',
           '减去参考帧','加上参考帧','与参考帧平均','幂律','对数','平方根','绝对值','限制范围']
 DENOISE_MODES=('关闭','中值 3×3（去孤立噪点）','高斯 3×3（轻度平滑）')
+LOWLIGHT_MODES=('关闭','自适应弱光提亮','弱光提亮 + 轻度降噪','星点/流星保护')
 DEFAULT_POINTS=[[0,'#000000'],[1000,'#143d8f'],[4000,'#23cda8'],[16000,'#ffe56c'],[65535,'#ffffff']]
 DEFAULT_CURVE_POINTS=[[0.,0.],[.25,.25],[.5,.5],[.75,.75],[1.,1.]]
 CURVE_MODES=('关闭','Camera Raw 参数曲线','点曲线')
@@ -170,6 +171,50 @@ def apply_denoise(a,mode='关闭',amount=100.):
     if mode=='中值 3×3（去孤立噪点）':filtered=cv2.medianBlur(out,3)
     else:filtered=cv2.GaussianBlur(out,(3,3),0.6)
     return out+(filtered-out)*alpha
+
+def apply_lowlight(a,mode='关闭',strength=50.):
+    """Apply a fast, preview-only low-light tone preset.
+
+    The public descriptions of modern low-light camera pipelines point to a
+    combination of sensor/ISP processing, adaptive tone mapping and 3-D
+    denoise rather than one portable filter.  This function deliberately
+    implements only the part that is safe for an incoming monochrome frame:
+    robust shadow lifting, optional small spatial smoothing, and a highlight
+    preserving curve for stars and meteors.  It never changes the raw frame or
+    the rolling accumulator.
+    """
+    out=np.asarray(a,dtype=np.float32)
+    if mode not in LOWLIGHT_MODES:raise ValueError('未知弱光增强模式')
+    amount=float(np.clip(strength,0,100))/100
+    if mode=='关闭' or amount<=0:return out
+    if out.ndim!=2:raise ValueError('弱光增强只接受二维灰度图像')
+    # Percentiles are estimated from at most about 200k samples so the
+    # operation stays cheap at live-camera frame rates.
+    stride=max(1,int(np.ceil(np.sqrt(out.size/200000))))
+    sample=out[::stride,::stride]
+    sample=sample[np.isfinite(sample)]
+    if sample.size==0:return out.copy()
+    black=float(np.percentile(sample,1.0));white=float(np.percentile(sample,99.7))
+    if not (math.isfinite(black) and math.isfinite(white)) or white<=black+1e-6:
+        return out.copy()
+    span=max(white-black,1e-6)
+    normalized=np.clip((out-black)/span,0,1)
+    # A restrained gamma lift makes the faint background visible without the
+    # severe posterisation caused by a hard display stretch.
+    gamma=1.0/(1.0+1.35*amount)
+    lifted=np.power(normalized,gamma,dtype=np.float32)
+    if mode=='星点/流星保护':
+        # Apply the lift mainly in the shadows.  Bright points retain their
+        # original normalized value, including values above the robust white
+        # estimate, so a meteor is not dimmed by the preset.
+        shadow_weight=np.square(np.clip((.78-normalized)/.78,0,1))
+        lifted=normalized+(lifted-normalized)*shadow_weight
+        original_norm=(out-black)/span
+        lifted=np.where(original_norm>1,original_norm,lifted)
+    result=black+lifted*span
+    if mode=='弱光提亮 + 轻度降噪':
+        result=apply_denoise(result,'高斯 3×3（轻度平滑）',25+45*amount)
+    return np.asarray(result,dtype=np.float32)
 
 def pixel_math(base,settings,window_average=None,window_sum=None,reference=None,window_is_local=False):
     op=settings.get('math_op','关闭')

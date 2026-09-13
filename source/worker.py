@@ -20,7 +20,7 @@ DEFAULTS=dict(exposure=100.,gain=1.,input_bits=16,compute_device='自动（优�
               contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',
               curve_shadows=0.,curve_darks=0.,curve_lights=0.,curve_highlights=0.,
               curve_points=DEFAULT_CURVE_POINTS,
-              denoise_mode='关闭',denoise_amount=50.,
+              denoise_mode='关闭',denoise_amount=50.,lowlight_mode='关闭',lowlight_strength=50.,
               trigger_condition='关闭',trigger_threshold=20.,trigger_mode='积分')
 
 class CaptureWorker(threading.Thread):
@@ -110,6 +110,9 @@ class CaptureWorker(threading.Thread):
             if 'denoise_mode' in new and new['denoise_mode'] not in DENOISE_MODES:raise ValueError('未知即时降噪模式')
             if 'denoise_amount' in new and (not np.isfinite(new['denoise_amount']) or not 0<=float(new['denoise_amount'])<=100):
                 raise ValueError('即时降噪强度需在0—100%之间')
+            if 'lowlight_mode' in new and new['lowlight_mode'] not in LOWLIGHT_MODES:raise ValueError('未知弱光增强模式')
+            if 'lowlight_strength' in new and (not np.isfinite(new['lowlight_strength']) or not 0<=float(new['lowlight_strength'])<=100):
+                raise ValueError('弱光增强强度需在0—100%之间')
             for name,low,high in [('contrast',-100,100),('sharpen',0,300),('sharpen_radius',.1,20),
                                   ('curve_shadows',-100,100),('curve_darks',-100,100),
                                   ('curve_lights',-100,100),('curve_highlights',-100,100)]:
@@ -190,7 +193,8 @@ class CaptureWorker(threading.Thread):
             else:
                 s=self.settings
                 import cv2
-                preview_result=apply_denoise(self.processed,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
+                preview_result=apply_lowlight(self.processed,s.get('lowlight_mode','关闭'),s.get('lowlight_strength',0))
+                preview_result=apply_denoise(preview_result,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
                 rgb=display_rgb(preview_result,s['black'],s['white'],s['gamma'],s['palette'],max_width=30000,custom_points=s['custom_points'],
                                 contrast=s['contrast'],sharpen=s['sharpen'],sharpen_radius=s['sharpen_radius'],
                                 curve_mode=s['curve_mode'],curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
@@ -228,15 +232,16 @@ class CaptureWorker(threading.Thread):
             if s['math_op']=='窗口积分':total=self.roll.result('积分')*(meta.exposure_ms/100)
             else:avg=self.roll.result('平均')*(meta.exposure_ms/100)
         result=pixel_math(result,s,avg,total,self.reference,self.window_local);self.processed=result
-        preview_result=apply_denoise(result,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
+        preview_result=apply_lowlight(result,s.get('lowlight_mode','关闭'),s.get('lowlight_strength',0))
+        preview_result=apply_denoise(preview_result,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
         counts,stats=histogram(preview_result,'processed')
         raw_counts,raw_stats=histogram(raw,'sensor',meta.bits)
         if s['stretch']:
             s['black']=stats['p01'];s['white']=max(s['black']+1,stats['p995'])
         view=preview_result
         if s.get('preview_crop'):
-            x,y,cw,ch=s['preview_crop'];h,w=result.shape
-            view=result[int(y*h):max(int(y*h)+1,int((y+ch)*h)),int(x*w):max(int(x*w)+1,int((x+cw)*w))]
+            x,y,cw,ch=s['preview_crop'];h,w=preview_result.shape
+            view=preview_result[int(y*h):max(int(y*h)+1,int((y+ch)*h)),int(x*w):max(int(x*w)+1,int((x+cw)*w))]
         rgb=display_rgb(view,s['black'],s['white'],s['gamma'],s['palette'],custom_points=s['custom_points'],
                         contrast=s['contrast'],sharpen=s['sharpen'],sharpen_radius=s['sharpen_radius'],
                         curve_mode=s['curve_mode'],curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
@@ -260,6 +265,7 @@ class CaptureWorker(threading.Thread):
                 trigger_state=trigger_state,trigger_brightness=trigger_brightness,window_unit=s['window_unit'],window_frames=s['window_frames'],
                 auto=s['auto'],ae_mode=s['ae_mode'],ae_status=self.ae_status,math_op=s['math_op'],stretch=s['stretch'],
                 denoise_mode=s.get('denoise_mode','关闭'),denoise_amount=s.get('denoise_amount',0),
+                lowlight_mode=s.get('lowlight_mode','关闭'),lowlight_strength=s.get('lowlight_strength',0),
                 exposure=meta.exposure_ms,gain=meta.gain,bits=meta.bits,raw_limit=(1<<meta.bits)-1,raw_mean=raw_stats['mean'],raw_max=raw_stats['max'],
                 processed_dtype=str(result.dtype),processed_overflow=float(result.max())>(1<<meta.bits)-1,black=s['black'],white=s['white'],
                 memory=(self.roll.bytes+self.roll.total_bytes)/1024**2,compute_device=self.compute.label,compute_kind=self.compute.kind,

@@ -1,12 +1,12 @@
 {
-  "version": "2.4",
+  "version": "2.5",
   "date": "2026-09-13",
   "positioning": "面向部分工业黑白相机",
   "backends": ["TUCam", "海康 MVS", "图谱 ToupCam"],
-  "automated_tests": {"passed": 47, "failed": 0, "seconds": 10.31},
+  "automated_tests": {"passed": 48, "failed": 0, "seconds": 10.57},
   "packaged_demo": {"exit_code": 0, "screenshot_created": true},
   "git_tree_export_demo": {"exit_code": 0, "screenshot_created": true, "native_pyd_files": 36},
-  "executable_sha256": "6C8723D3B5A34F90D7D8DC20643B5EE44D0DFC5DB819AE590F7CF53530497209",
-  "coverage": ["模拟厂商接口连接与释放", "曝光和增益读回", "可用位深切换与原始范围校验", "分辨率与原始灰度", "格式拒绝", "按时间或帧数滚动窗口", "滚动窗口逐像素最大值", "OpenCL GPU滚动累加、最大值与CPU回退", "亮度阈值触发模式切换", "低开销即时中值／高斯降噪", "界面与配置", "图像处理", "OBS纯画面窗口模拟行为"],
+  "executable_sha256": "539360C93F4535F89F98C659707294C3B8B13C2937BFA3531FFE23F93164E50E",
+  "coverage": ["模拟厂商接口连接与释放", "曝光和增益读回", "可用位深切换与原始范围校验", "分辨率与原始灰度", "格式拒绝", "按时间或帧数滚动窗口", "滚动窗口逐像素最大值", "OpenCL GPU滚动累加、最大值与CPU回退", "亮度阈值触发模式切换", "低开销即时中值／高斯降噪", "弱光增强三种预设与星点亮点保护", "界面与配置", "图像处理", "OBS纯画面窗口模拟行为"],
   "limitations": ["本次未完成三品牌实机验证", "本次未进行实际OBS推流", "支持范围以README及SDK接入说明为准，不能视为全部型号兼容认证"]
 }

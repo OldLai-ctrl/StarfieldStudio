@@ -71,6 +71,20 @@ def test_live_denoise_is_low_cost_and_preview_only():
     np.testing.assert_array_equal(image,original)
     np.testing.assert_array_equal(apply_denoise(image,'关闭',100),image)
 
+def test_lowlight_presets_lift_shadows_and_keep_star_peaks():
+    image=np.linspace(100,10000,64*64,dtype=np.float32).reshape(64,64)
+    image[20,20]=20000;original=image.copy()
+    lifted=apply_lowlight(image,'自适应弱光提亮',60)
+    denoised=apply_lowlight(image,'弱光提亮 + 轻度降噪',60)
+    protected=apply_lowlight(image,'星点/流星保护',60)
+    assert lifted.shape==image.shape and denoised.shape==image.shape and protected.shape==image.shape
+    assert np.isfinite(lifted).all() and np.isfinite(denoised).all() and np.isfinite(protected).all()
+    assert lifted[32,32]>image[32,32]
+    assert protected[20,20]>=image[20,20]
+    np.testing.assert_array_equal(image,original)
+    assert apply_lowlight(image,'关闭',60) is image
+    with pytest.raises(ValueError):apply_lowlight(image,'不存在',50)
+
 def test_local_window_replaces_only_selected_region():
     w=CaptureWorker();w.meta=FrameMeta();w.raw=np.ones((4,4),np.uint16);w.single=np.ones((4,4),np.float32)
     w.settings.update(mode='关闭',math_op='窗口积分',math_roi=(.5,.5,.5,.5));w.window_local=True
