@@ -1,6 +1,6 @@
 # Starfield Studio
 
-面向部分工业黑白相机的 Windows 实时采集、图像校正和直播工具。支持 TUCam、海康 MVS、图谱 ToupCam 三类原生接口，适用于星野、红外成像及其他黑白实时成像场景。
+完全Vibe Coding而成的面向部分工业黑白相机的 Windows 实时采集、图像校正和直播工具。支持 TUCam、海康 MVS、图谱 ToupCam 三类原生接口，适用于星野、红外成像及其他黑白实时成像场景。
 
 ![操作界面](interface.png)
 
