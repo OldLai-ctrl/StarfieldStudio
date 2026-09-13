@@ -148,7 +148,10 @@ class RollingIntegrator:
             else:self.gpu=False
             return
         self.frames=frames
-        self.total=None if total is None else np.asarray(total,dtype=np.float64)
+        # The OpenCL accumulator is float32; keeping that dtype during the
+        # migration preserves its values and avoids doubling the cache budget
+        # just because the driver was reset.
+        self.total=None if total is None else np.asarray(total,dtype=np.float32)
         self.total_nbytes=0 if self.total is None else self.total.nbytes
         self.gpu=False
         if hasattr(backend,'disable_gpu'):backend.disable_gpu(reason)

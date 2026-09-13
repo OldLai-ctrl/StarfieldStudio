@@ -6,7 +6,7 @@
   "automated_tests": {"passed": 44, "failed": 0, "seconds": 10.09},
   "packaged_demo": {"exit_code": 0, "screenshot_created": true},
   "git_tree_export_demo": {"exit_code": 0, "screenshot_created": true, "native_pyd_files": 36},
-  "executable_sha256": "86FF6CADFFECCFFE9F05170647DFAB34EAE53C750D96345FA93D5B47D72A8C95",
+  "executable_sha256": "62D3C25B790B2AEC43A3160ACDB521E217FEA4E5DFDA0D7593C7A742DBE39939",
   "coverage": ["模拟厂商接口连接与释放", "曝光和增益读回", "可用位深切换与原始范围校验", "分辨率与原始灰度", "格式拒绝", "按时间或帧数滚动窗口", "OpenCL GPU滚动累加与CPU回退", "亮度阈值触发模式切换", "界面与配置", "图像处理", "OBS纯画面窗口模拟行为"],
   "limitations": ["本次未完成三品牌实机验证", "本次未进行实际OBS推流", "支持范围以README及SDK接入说明为准，不能视为全部型号兼容认证"]
 }
