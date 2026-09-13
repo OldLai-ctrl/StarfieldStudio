@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QTimer, QRectF, Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QPainterPath, QAction, QFontDatabase, QFont, QLinearGradient
 from PySide6.QtWidgets import *
 from worker import CaptureWorker, DEFAULTS
+from compute import DEVICE_CHOICES
 from camera import default_sdk
 from camera_common import BACKENDS, sdk_path
 from processing import *
@@ -217,7 +218,7 @@ class PaletteDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Starfield Studio 2.2 | 工业黑白相机直播');self.resize(1430,920)
+        super().__init__();self.setWindowTitle('Starfield Studio 2.3 | 工业黑白相机直播');self.resize(1430,920)
         self.worker=CaptureWorker();self.controls={};self.connected=False;self.recording=False;self.seen=0
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
         self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
@@ -321,6 +322,9 @@ class MainWindow(QMainWindow):
         f.addRow('窗口时长 / 秒',self.spin('seconds',.05,120,3,2))
         f.addRow('窗口帧数',self.spin('window_frames',1,100000,30,0))
         f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分')]))
+        compute_combo=self.combo('compute_device',[(s,s) for s in DEVICE_CHOICES])
+        compute_combo.setToolTip('自动优先使用 OpenCL GPU；GPU（OpenCL）适用于安装了驱动运行时的 NVIDIA 与 Intel 显卡。不可用时会自动回退 CPU。')
+        f.addRow('计算设备',compute_combo)
         f.addRow('亮度触发条件',self.combo('trigger_condition',[(s,s) for s in ['关闭','平均亮度低于','平均亮度高于']]))
         f.addRow('触发阈值 / %',self.spin('trigger_threshold',0,100,20,1))
         f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('关闭叠加 · 单帧','关闭')]))
@@ -436,7 +440,7 @@ class MainWindow(QMainWindow):
         v=self.values(['exposure','gain','input_bits','resolution','native_bin','software_bin']);v={k:x for k,x in v.items() if x is not None}
         self.worker.send('settings',values=v)
     def apply_processing(self):
-        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','seconds','window_unit','window_frames','mode','memory','trigger_condition','trigger_threshold','trigger_mode','dark','bias','flat'])
+        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','seconds','window_unit','window_frames','mode','compute_device','memory','trigger_condition','trigger_threshold','trigger_mode','dark','bias','flat'])
         if v['ae_low']>v['ae_high']:self.show_error('最短曝光不能大于最长曝光');return
         self.worker.send('settings',values=v)
     def apply_display(self):
@@ -553,6 +557,8 @@ class MainWindow(QMainWindow):
             kind=e['kind']
             if kind=='connected':
                 self.connected=True;self.connect_btn.setText('断开连接');self.device_label.setText(e['name'])
+                compute=e.get('compute',{});device_text=compute.get('label','CPU')
+                self.device_label.setText(e['name']+'\n计算：'+device_text)
                 self.source.setEnabled(False);self.index.setEnabled(False);self.backend.setEnabled(False);self.dll.setEnabled(False)
                 for k,r in [('exposure',e['exp_range']),('gain',e['gain_range'])]:
                     self.controls[k].setRange(r[0],r[1]);self.controls[k].setSingleStep(max(.001,r[2]))
@@ -565,7 +571,7 @@ class MainWindow(QMainWindow):
                     c.setEnabled(bool(opts) and (k!='input_bits' or len(opts)>1))
                     c.blockSignals(False)
                 self.set_values(e)
-                self.log.appendPlainText('已连接：'+e['name']);self.output.message=''
+                self.log.appendPlainText('已连接：'+e['name']);self.log.appendPlainText('计算设备：'+device_text);self.output.message=''
             elif kind=='disconnected':
                 self.connected=False;self.connect_btn.setText('连接相机');self.live_label.setText('未连接');self.output.message='未连接相机';self.output.update()
                 self.source.setEnabled(True);self.index.setEnabled(True);self.backend.setEnabled(True);self.dll.setEnabled(True);self.controls['input_bits'].setEnabled(True);self.output.pix=QPixmap()
@@ -594,7 +600,7 @@ class MainWindow(QMainWindow):
             configured_text='单帧' if d['mode']=='关闭' else '滚动'+d['mode']
             self.live_label.setText(('模拟预览' if d['sim'] else '实际采集')+f"   ·   {d['shape'][1]} × {d['shape'][0]}   ·   {self.fps:.1f} 帧/秒   ·   {mode_text}")
             ae=d['ae_mode'];stretch='持续自动' if d['stretch'] else '固定'
-            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用'))
+            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用')+'  ·  '+d.get('compute_device','CPU'))
             trigger_line='' if configured_text==mode_text else f"\n设置模式  {configured_text}"
             overflow='；滚动积分超过原始范围属于浮点累加' if d.get('processed_overflow') and d.get('effective_mode')=='积分' else ''
             self.stats.setText(f"原始帧 Mono{d['bits']} · 有效范围 0—{d['raw_limit']} · 16 位容器\n原始均值  {d['raw_mean']:.1f} · 原始峰值  {d['raw_max']:.1f}\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}{trigger_line}\n窗口缓存  {d['frames']} 帧（{('时间' if d['window_unit']=='时间' else '帧数')}）\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n处理类型  {d['processed_dtype']}{overflow}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")

@@ -106,11 +106,17 @@ def physical_memory():
 
 class RollingIntegrator:
     """Finite FIFO using either elapsed time or a fixed number of frames."""
-    def __init__(self, seconds=3.0, memory_mb=768, window_unit='时间', frame_limit=30):
+    def __init__(self, seconds=3.0, memory_mb=768, window_unit='时间', frame_limit=30, backend=None):
         self.seconds=float(seconds);self.window_unit='时间';self.frame_limit=int(frame_limit)
+        self.backend=backend;self.gpu=bool(getattr(backend,'use_gpu',False));self.total_nbytes=0;self._shape=None
         self.set_window(window_unit,seconds,frame_limit)
         self.set_budget(memory_mb)
         self.clear()
+    def set_backend(self,backend):
+        changed=(self.gpu!=bool(getattr(backend,'use_gpu',False)))
+        self.backend=backend;self.gpu=bool(getattr(backend,'use_gpu',False))
+        if changed:self.clear()
+        return changed
     def set_window(self,unit='时间',seconds=None,frames=None):
         if unit not in ('时间','帧数'):raise ValueError('滚动窗口单位只能是时间或帧数')
         if seconds is not None:
@@ -126,33 +132,83 @@ class RollingIntegrator:
         self.auto=memory_mb==0
         self.limit=int((1024 if self.auto else memory_mb)*1024**2)
     def clear(self):
-        self.frames=deque(); self.total=None; self.bytes=0; self.last_time=None
-    def push(self, frame, stamp):
-        if self.last_time is not None and stamp<=self.last_time:
-            raise ValueError('Frame timestamps must strictly increase')
-        if self.total is not None and self.total.shape!=frame.shape: self.clear()
-        if self.total is None: self.total=np.zeros(frame.shape,np.float64)
+        self.frames=deque(); self.total=None; self.total_nbytes=0; self._shape=None; self.bytes=0; self.last_time=None
+    def _fallback_cpu(self,reason):
+        """Migrate a live OpenCL window to NumPy without dropping its frames."""
+        if not self.gpu:return
+        backend=self.backend
+        try:
+            total=backend.download(self.total) if self.total is not None else None
+            frames=deque((stamp,backend.download(frame).astype(np.float32,copy=False)) for stamp,frame in self.frames)
+        except Exception as exc:
+            # If downloading the broken device buffer also fails, a safe reset
+            # is preferable to publishing a corrupted accumulation.
+            self.clear()
+            if hasattr(backend,'disable_gpu'):backend.disable_gpu(f'{reason}；设备缓存读取失败：{exc}')
+            else:self.gpu=False
+            return
+        self.frames=frames
+        self.total=None if total is None else np.asarray(total,dtype=np.float64)
+        self.total_nbytes=0 if self.total is None else self.total.nbytes
+        self.gpu=False
+        if hasattr(backend,'disable_gpu'):backend.disable_gpu(reason)
+    def _push_once(self,source,stamp):
+        """Append one frame; GPU operations are kept transactional."""
+        prepared=np.asarray(source,dtype=np.float32)
+        frame_bytes=prepared.nbytes
+        if self.total is not None and self._shape!=source.shape:self.clear()
+        if self.total is None:
+            self.total=self.backend.upload(np.zeros(source.shape,np.float32)) if self.gpu else np.zeros(source.shape,np.float64)
+            self._shape=source.shape;self.total_nbytes=source.size*(4 if self.gpu else 8)
         if self.window_unit=='帧数':
             while len(self.frames)>=self.frame_limit:
-                _,old=self.frames.popleft();self.total-=old;self.bytes-=old.nbytes
+                old_stamp,old=self.frames[0]
+                updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
+                self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
         else:
             while self.frames and self.frames[0][0]<=stamp-self.seconds+1e-9:
-                _,old=self.frames.popleft(); self.total-=old; self.bytes-=old.nbytes
-        a=np.array(frame,dtype=np.float32,copy=True)
-        required=self.bytes+a.nbytes+self.total.nbytes
+                old_stamp,old=self.frames[0]
+                updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
+                self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
+        a=self.backend.upload(prepared) if self.gpu else np.array(prepared,copy=True)
+        required=self.bytes+frame_bytes+self.total_nbytes
         if required>self.limit and self.auto:
             total,available=physical_memory()
-            extra=required-(self.bytes+self.total.nbytes)
+            extra=required-(self.bytes+self.total_nbytes)
             # Leave at least 2 GiB and half currently free RAM to the OS and other apps.
             if total and available-extra>=max(2*1024**3,available*.5):
                 self.limit=required
         if required>self.limit:
             reason='可用物理内存不足，自动扩展已停止' if self.auto else f'手动缓存上限 {self.limit/1024**2:.0f} MB 已用满（可将缓存设为 0 自动扩展）'
             raise MemoryError(reason+'；未缩短窗口或降低画质。请减少窗口时长或处理尺寸后恢复采集。')
-        self.frames.append((stamp,a)); self.total+=a; self.bytes+=a.nbytes; self.last_time=stamp
+        updated=self.backend.add(self.total,a) if self.gpu else self.total+a
+        self.frames.append((stamp,a));self.total=updated;self.bytes+=frame_bytes;self.last_time=stamp
+    def push(self, frame, stamp):
+        if self.last_time is not None and stamp<=self.last_time:
+            raise ValueError('Frame timestamps must strictly increase')
+        source=np.asarray(frame)
+        try:
+            self._push_once(source,stamp)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            if not self.gpu:raise
+            self._fallback_cpu(str(exc))
+            self._push_once(source,stamp)
     def result(self,mode='平均'):
         if self.total is None: return None
-        return (self.total/(len(self.frames) if mode=='平均' else 1)).astype(np.float32)
+        if self.gpu:
+            try:total=self.backend.download(self.total)
+            except Exception as exc:
+                self._fallback_cpu(str(exc));total=self.total
+        else:total=self.total
+        return (total/(len(self.frames) if mode=='平均' else 1)).astype(np.float32)
+    @property
+    def total_shape(self):
+        return self._shape
+    @property
+    def total_bytes(self):
+        return self.total_nbytes
     @property
     def span(self):
         return self.frames[-1][0]-self.frames[0][0] if len(self.frames)>1 else 0.0

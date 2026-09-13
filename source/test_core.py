@@ -8,6 +8,39 @@ from core import *
 from camera import Frame, decode_frame, SimCamera
 from camera_common import validate_native_frame
 from worker import CaptureWorker
+from compute import ComputeEngine, DEVICE_CHOICES
+
+def test_compute_engine_cpu_mode_and_probe_are_serializable():
+    engine=ComputeEngine('CPU')
+    status=engine.status()
+    assert DEVICE_CHOICES[1]=='CPU'
+    assert status['requested']=='CPU' and status['kind']=='cpu' and not engine.use_gpu
+    info=ComputeEngine.probe()
+    assert set(('opencl','label','vendor','name'))<=set(info)
+    assert isinstance(info['opencl'],bool)
+
+def test_opencl_rolling_accumulation_when_runtime_is_available():
+    engine=ComputeEngine('GPU（OpenCL）')
+    if not engine.use_gpu:
+        pytest.skip('当前测试机没有可用 OpenCL GPU')
+    r=RollingIntegrator(window_unit='帧数',frame_limit=3,memory_mb=16,backend=engine)
+    for i in range(1,5):r.push(np.full((3,4),i,np.float32),i)
+    assert len(r.frames)==3 and r.gpu
+    np.testing.assert_allclose(r.result('积分'),np.full((3,4),9,np.float32))
+    np.testing.assert_allclose(r.result('平均'),np.full((3,4),3,np.float32))
+
+def test_opencl_engine_can_fall_back_without_losing_window():
+    engine=ComputeEngine('GPU（OpenCL）')
+    if not engine.use_gpu:
+        pytest.skip('当前测试机没有可用 OpenCL GPU')
+    r=RollingIntegrator(window_unit='帧数',frame_limit=2,memory_mb=16,backend=engine)
+    r.push(np.full((2,2),4,np.float32),1)
+    original_add=engine.add
+    engine.add=lambda left,right: (_ for _ in ()).throw(RuntimeError('driver reset'))
+    try:r.push(np.full((2,2),5,np.float32),2)
+    finally:engine.add=original_add
+    assert not r.gpu and r.backend.kind=='cpu' and len(r.frames)==2
+    np.testing.assert_allclose(r.result('平均'),np.full((2,2),4.5,np.float32))
 
 def test_exact_rolling_window():
     r=RollingIntegrator(2)

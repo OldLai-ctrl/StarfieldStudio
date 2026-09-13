@@ -9,8 +9,9 @@ from core import *
 from camera import TucamCamera, SimCamera
 from camera_common import open_camera, validate_native_frame, VALID_BITS
 from processing import *
+from compute import ComputeEngine, DEVICE_CHOICES
 
-DEFAULTS=dict(exposure=100.,gain=1.,input_bits=16,seconds=3.,window_unit='时间',window_frames=30,mode='平均',software_bin=1,
+DEFAULTS=dict(exposure=100.,gain=1.,input_bits=16,compute_device='自动（优先 GPU）',seconds=3.,window_unit='时间',window_frames=30,mode='平均',software_bin=1,
               dark=False,bias=False,flat=False,auto=False,target=20.,ae_low=5.,ae_high=5000.,
               black=0.,white=8000.,gamma=1.,palette='灰度',stretch=False,memory=0,hist_source='相机原始灰度',
               ae_mode='手动',ae_gain_low=1.,ae_gain_high=257.,ae_roi=None,ae_show=True,
@@ -26,7 +27,7 @@ class CaptureWorker(threading.Thread):
         super().__init__(daemon=True)
         self.commands=queue.Queue();self.events=queue.Queue();self.lock=threading.Lock()
         self.latest=None;self.serial=0;self.cam=None;self.running=True;self.paused=False
-        self.settings=copy.deepcopy(DEFAULTS);self.library=CalibrationLibrary();self.roll=RollingIntegrator(3,0,'时间',30)
+        self.settings=copy.deepcopy(DEFAULTS);self.library=CalibrationLibrary();self.compute=ComputeEngine(self.settings['compute_device']);self.roll=RollingIntegrator(3,0,'时间',30,self.compute)
         self.raw=None;self.processed=None;self.meta=None;self.rec=None;self.master=None;self.last_ae=0
         self.single=None;self.last_frame_time=None;self.window_local=False;self.pre_math=None;self.reference=None
         self.ae_status='手动';self.ae_previous=None
@@ -37,7 +38,7 @@ class CaptureWorker(threading.Thread):
         self.event('connected',name=c.name,exposure=c.meta.exposure_ms,gain=c.meta.gain,
                    exp_range=c.exp_range,gain_range=c.gain_range,resolutions=c.resolutions,bins=c.bins,
                    resolution=c.mode,native_bin=c.bin_value,bit_options=getattr(c,'bit_options',[(c.meta.bits,f'Mono{c.meta.bits}')]),
-                   input_bits=getattr(c,'input_bits',c.meta.bits),sim=isinstance(c,SimCamera))
+                   input_bits=getattr(c,'input_bits',c.meta.bits),compute=self.compute.status(),sim=isinstance(c,SimCamera))
     def end_record(self):
         if self.rec:
             self.rec.close();self.rec=None;self.event('log',text='原始 SER 视频已完成保存')
@@ -86,6 +87,7 @@ class CaptureWorker(threading.Thread):
                 try:new['input_bits']=int(new['input_bits'])
                 except Exception:raise ValueError('输入位深必须是整数')
                 if new['input_bits'] not in VALID_BITS:raise ValueError('输入位深不受支持')
+            if 'compute_device' in new and new['compute_device'] not in DEVICE_CHOICES:raise ValueError('计算设备选项无效')
             if 'window_unit' in new and new['window_unit'] not in ('时间','帧数'):raise ValueError('滚动窗口单位无效')
             if 'window_frames' in new:
                 new['window_frames']=int(new['window_frames'])
@@ -114,7 +116,7 @@ class CaptureWorker(threading.Thread):
             if proposed['math_low']>proposed['math_high'] or proposed['math_clip_low']>proposed['math_clip_high']:raise ValueError('像素范围下限不能大于上限')
             if proposed['math_op']=='幂律' and not .05<=proposed['math_k']<=8:raise ValueError('幂律指数请设置在0.05至8之间')
             if new.get('auto'):self.end_record()
-            if any(self.settings.get(n)!=v for n,v in new.items() if n in ('gain','input_bits','software_bin','dark','bias','flat','window_unit','window_frames','trigger_condition','trigger_mode')):self.roll.clear()
+            if any(self.settings.get(n)!=v for n,v in new.items() if n in ('gain','input_bits','software_bin','dark','bias','flat','window_unit','window_frames','trigger_condition','trigger_mode','compute_device')):self.roll.clear()
             if ('mode' in new and (new['mode']=='关闭' or self.settings['mode']=='关闭')) or ('math_roi' in new) or ('math_op' in new and self.settings['mode']=='关闭'):self.roll.clear()
             if self.cam:
                 hw={n:v for n,v in new.items() if n in ('exposure','gain','resolution','native_bin','input_bits')}
@@ -125,6 +127,9 @@ class CaptureWorker(threading.Thread):
                     if 'resolution' in hw:new['resolution']=self.cam.mode
                     if 'input_bits' in hw:new['input_bits']=getattr(self.cam,'input_bits',self.cam.meta.bits)
                 elif 'auto' in new and hasattr(self.cam,'ensure_manual'):self.cam.ensure_manual()
+            if 'compute_device' in new:
+                self.compute.set_mode(new['compute_device']);self.roll.set_backend(self.compute)
+                self.event('log',text='计算设备：'+self.compute.label)
             self.settings.update(new);self.roll.set_window(self.settings['window_unit'],self.settings['seconds'],self.settings['window_frames'])
             if 'ae_mode' in new:self.ae_status=new['ae_mode'];self.ae_previous=None
             if 'memory' in new:self.roll.set_budget(self.settings['memory'])
@@ -246,7 +251,8 @@ class CaptureWorker(threading.Thread):
                 auto=s['auto'],ae_mode=s['ae_mode'],ae_status=self.ae_status,math_op=s['math_op'],stretch=s['stretch'],
                 exposure=meta.exposure_ms,gain=meta.gain,bits=meta.bits,raw_limit=(1<<meta.bits)-1,raw_mean=raw_stats['mean'],raw_max=raw_stats['max'],
                 processed_dtype=str(result.dtype),processed_overflow=float(result.max())>(1<<meta.bits)-1,black=s['black'],white=s['white'],
-                memory=(self.roll.bytes+(self.roll.total.nbytes if self.roll.total is not None else 0))/1024**2,sim=isinstance(self.cam,SimCamera))
+                memory=(self.roll.bytes+self.roll.total_bytes)/1024**2,compute_device=self.compute.label,compute_kind=self.compute.kind,
+                sim=isinstance(self.cam,SimCamera))
     def calibration_choices(self):
         s=self.settings;m=self.meta;shape=self.raw.shape
         if not (s['dark'] or s['bias'] or s['flat']):return None,None

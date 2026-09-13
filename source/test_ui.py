@@ -103,6 +103,10 @@ def test_bit_depth_frame_window_and_brightness_trigger():
         unit=w.controls['window_unit'];unit.setCurrentIndex(unit.findData('帧数'));unit.activated.emit(unit.currentIndex())
         w.controls['window_frames'].setValue(4);w.apply_processing()
         pump(app,lambda:w.worker.settings['window_unit']=='帧数' and w.worker.settings['window_frames']==4)
+        device=w.controls['compute_device']
+        assert device.findData('CPU')>=0 and device.findData('GPU（OpenCL）')>=0
+        device.setCurrentIndex(device.findData('CPU'));device.activated.emit(device.currentIndex())
+        pump(app,lambda:w.worker.compute.kind=='cpu' and w.latest.get('compute_kind')=='cpu')
         w.worker.send('settings',values={'mode':'关闭','trigger_condition':'平均亮度高于','trigger_threshold':0,'trigger_mode':'积分'})
         pump(app,lambda:w.latest is not None and w.latest['effective_mode']=='积分')
         assert w.latest['frames']<=4 and w.latest['raw_limit']==16383
