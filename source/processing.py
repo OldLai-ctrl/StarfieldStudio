@@ -8,6 +8,7 @@ WINDOW_OPS={'窗口平均','窗口积分','减去窗口平均','加上窗口平�
 REF_OPS={'减去参考帧','加上参考帧','与参考帧平均'}
 MATH_OPS=['关闭','加常数','乘系数','窗口平均','窗口积分','减去窗口平均','加上窗口平均',
           '减去参考帧','加上参考帧','与参考帧平均','幂律','对数','平方根','绝对值','限制范围']
+DENOISE_MODES=('关闭','中值 3×3（去孤立噪点）','高斯 3×3（轻度平滑）')
 DEFAULT_POINTS=[[0,'#000000'],[1000,'#143d8f'],[4000,'#23cda8'],[16000,'#ffe56c'],[65535,'#ffffff']]
 DEFAULT_CURVE_POINTS=[[0.,0.],[.25,.25],[.5,.5],[.75,.75],[1.,1.]]
 CURVE_MODES=('关闭','Camera Raw 参数曲线','点曲线')
@@ -153,6 +154,22 @@ def apply_display_adjustments(x,contrast=0.,sharpen=0.,sharpen_radius=1.,curve_m
         blur=cv2.GaussianBlur(out,(0,0),radius)
         out=np.clip(out+(amount/100.)*(out-blur),0,1)
     return out
+
+def apply_denoise(a,mode='关闭',amount=100.):
+    """Apply a small preview-time spatial denoise filter.
+
+    The filter is intentionally local and stateless so it adds no rolling
+    memory and remains suitable for a live OBS feed.  It is applied after
+    stacking and does not alter the raw or processed file buffers.
+    """
+    out=np.asarray(a,dtype=np.float32)
+    if mode not in DENOISE_MODES:raise ValueError('未知即时降噪模式')
+    alpha=float(np.clip(amount,0,100))/100
+    if mode=='关闭' or alpha<=0:return out
+    if out.ndim!=2:raise ValueError('即时降噪只接受二维灰度图像')
+    if mode=='中值 3×3（去孤立噪点）':filtered=cv2.medianBlur(out,3)
+    else:filtered=cv2.GaussianBlur(out,(3,3),0.6)
+    return out+(filtered-out)*alpha
 
 def pixel_math(base,settings,window_average=None,window_sum=None,reference=None,window_is_local=False):
     op=settings.get('math_op','关闭')

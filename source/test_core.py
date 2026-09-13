@@ -42,6 +42,24 @@ def test_opencl_engine_can_fall_back_without_losing_window():
     assert not r.gpu and r.backend.kind=='cpu' and len(r.frames)==2
     np.testing.assert_allclose(r.result('平均'),np.full((2,2),4.5,np.float32))
 
+def test_rolling_maximum_keeps_latest_window_only():
+    r=RollingIntegrator(window_unit='帧数',frame_limit=3,memory_mb=16)
+    r.set_max_enabled(True)
+    values=[[[1,8],[4,2]],[[3,5],[2,7]],[[2,6],[9,1]],[[0,4],[6,10]]]
+    for i,a in enumerate(values):r.push(np.asarray(a,np.float32),i)
+    assert len(r.frames)==3
+    np.testing.assert_allclose(r.result('最大值'),[[3,6],[9,10]])
+    assert r.total_bytes>r.total_nbytes
+
+def test_gpu_rolling_maximum_when_opencl_is_available():
+    engine=ComputeEngine('GPU（OpenCL）')
+    if not engine.use_gpu:
+        pytest.skip('当前测试机没有可用 OpenCL GPU')
+    r=RollingIntegrator(window_unit='帧数',frame_limit=3,memory_mb=16,backend=engine)
+    r.set_max_enabled(True)
+    for i in range(4):r.push(np.full((2,2),i,np.float32),i)
+    np.testing.assert_allclose(r.result('最大值'),np.full((2,2),3,np.float32))
+
 def test_exact_rolling_window():
     r=RollingIntegrator(2)
     for t,v in [(0,1),(.5,3),(1.9,8),(2,12)]:r.push(np.full((2,3),v),t)

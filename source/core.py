@@ -109,6 +109,7 @@ class RollingIntegrator:
     def __init__(self, seconds=3.0, memory_mb=768, window_unit='时间', frame_limit=30, backend=None):
         self.seconds=float(seconds);self.window_unit='时间';self.frame_limit=int(frame_limit)
         self.backend=backend;self.gpu=bool(getattr(backend,'use_gpu',False));self.total_nbytes=0;self._shape=None
+        self.max_enabled=False;self.max_block_size=8
         self.set_window(window_unit,seconds,frame_limit)
         self.set_budget(memory_mb)
         self.clear()
@@ -133,6 +134,53 @@ class RollingIntegrator:
         self.limit=int((1024 if self.auto else memory_mb)*1024**2)
     def clear(self):
         self.frames=deque(); self.total=None; self.total_nbytes=0; self._shape=None; self.bytes=0; self.last_time=None
+        self.max_blocks=deque();self.max_nbytes=0
+    def _max_reduce(self,values):
+        if not values:return None
+        result=values[0]
+        for value in values[1:]:
+            result=self.backend.maximum(result,value) if self.gpu else np.maximum(result,value)
+        return result
+    def _max_append(self,item):
+        """Add a shared frame reference to the small block-max structure."""
+        if not self.max_enabled:return
+        stamp,frame=item
+        if not self.max_blocks or len(self.max_blocks[-1]['frames'])>=self.max_block_size:
+            self.max_blocks.append({'frames':deque([item]),'maximum':frame})
+            self.max_nbytes+=self._frame_nbytes(frame)
+            return
+        block=self.max_blocks[-1]
+        updated=self.backend.maximum(block['maximum'],frame) if self.gpu else np.maximum(block['maximum'],frame)
+        block['frames'].append(item);block['maximum']=updated
+    def _max_remove_oldest(self):
+        if not self.max_enabled or not self.max_blocks:return
+        block=self.max_blocks[0]
+        if len(block['frames'])>1:
+            updated=self._max_reduce([frame for _,frame in list(block['frames'])[1:]])
+        else:updated=None
+        block['frames'].popleft()
+        if updated is None:
+            self.max_blocks.popleft()
+            self.max_nbytes-=self._frame_nbytes(block['maximum'])
+        else:block['maximum']=updated
+    def _frame_nbytes(self,frame):
+        if self.gpu:return int(np.prod(self._shape))*4
+        return np.asarray(frame).nbytes
+    def _rebuild_max_blocks(self):
+        self.max_blocks=deque();self.max_nbytes=0
+        if not self.max_enabled:return
+        for item in self.frames:self._max_append(item)
+    def set_max_enabled(self,enabled):
+        enabled=bool(enabled)
+        if enabled==self.max_enabled:return
+        self.max_enabled=enabled
+        if not enabled:
+            self.max_blocks=deque();self.max_nbytes=0
+            return
+        try:self._rebuild_max_blocks()
+        except Exception as exc:
+            if not self.gpu:raise
+            self._fallback_cpu(str(exc))
     def _fallback_cpu(self,reason):
         """Migrate a live OpenCL window to NumPy without dropping its frames."""
         if not self.gpu:return
@@ -155,6 +203,7 @@ class RollingIntegrator:
         self.total_nbytes=0 if self.total is None else self.total.nbytes
         self.gpu=False
         if hasattr(backend,'disable_gpu'):backend.disable_gpu(reason)
+        self._rebuild_max_blocks()
     def _push_once(self,source,stamp):
         """Append one frame; GPU operations are kept transactional."""
         prepared=np.asarray(source,dtype=np.float32)
@@ -167,17 +216,24 @@ class RollingIntegrator:
             while len(self.frames)>=self.frame_limit:
                 old_stamp,old=self.frames[0]
                 updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
+                self._max_remove_oldest()
                 self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
         else:
             while self.frames and self.frames[0][0]<=stamp-self.seconds+1e-9:
                 old_stamp,old=self.frames[0]
                 updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
+                self._max_remove_oldest()
                 self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
         a=self.backend.upload(prepared) if self.gpu else np.array(prepared,copy=True)
-        required=self.bytes+frame_bytes+self.total_nbytes
+        new_block=self.max_enabled and (not self.max_blocks or len(self.max_blocks[-1]['frames'])>=self.max_block_size)
+        if self.max_enabled and not new_block:
+            last=self.max_blocks[-1]
+            new_max=self.backend.maximum(last['maximum'],a) if self.gpu else np.maximum(last['maximum'],a)
+        else:new_max=a
+        required=self.bytes+frame_bytes+self.total_nbytes+self.max_nbytes+(frame_bytes if new_block else 0)
         if required>self.limit and self.auto:
             total,available=physical_memory()
-            extra=required-(self.bytes+self.total_nbytes)
+            extra=required-(self.bytes+self.total_nbytes+self.max_nbytes)
             # Leave at least 2 GiB and half currently free RAM to the OS and other apps.
             if total and available-extra>=max(2*1024**3,available*.5):
                 self.limit=required
@@ -185,7 +241,13 @@ class RollingIntegrator:
             reason='可用物理内存不足，自动扩展已停止' if self.auto else f'手动缓存上限 {self.limit/1024**2:.0f} MB 已用满（可将缓存设为 0 自动扩展）'
             raise MemoryError(reason+'；未缩短窗口或降低画质。请减少窗口时长或处理尺寸后恢复采集。')
         updated=self.backend.add(self.total,a) if self.gpu else self.total+a
-        self.frames.append((stamp,a));self.total=updated;self.bytes+=frame_bytes;self.last_time=stamp
+        item=(stamp,a)
+        if self.max_enabled:
+            if new_block:
+                self.max_blocks.append({'frames':deque([item]),'maximum':new_max});self.max_nbytes+=frame_bytes
+            else:
+                self.max_blocks[-1]['frames'].append(item);self.max_blocks[-1]['maximum']=new_max
+        self.frames.append(item);self.total=updated;self.bytes+=frame_bytes;self.last_time=stamp
     def push(self, frame, stamp):
         if self.last_time is not None and stamp<=self.last_time:
             raise ValueError('Frame timestamps must strictly increase')
@@ -198,8 +260,19 @@ class RollingIntegrator:
             if not self.gpu:raise
             self._fallback_cpu(str(exc))
             self._push_once(source,stamp)
+    def _max_result(self):
+        if not self.max_enabled:self.set_max_enabled(True)
+        if not self.max_blocks:return None
+        value=self._max_reduce([block['maximum'] for block in self.max_blocks])
+        return self.backend.download(value) if self.gpu else value
     def result(self,mode='平均'):
         if self.total is None: return None
+        if mode=='最大值':
+            try:value=self._max_result()
+            except Exception as exc:
+                if not self.gpu:raise
+                self._fallback_cpu(str(exc));value=self._max_result()
+            return None if value is None else np.asarray(value,dtype=np.float32)
         if self.gpu:
             try:total=self.backend.download(self.total)
             except Exception as exc:
@@ -211,7 +284,7 @@ class RollingIntegrator:
         return self._shape
     @property
     def total_bytes(self):
-        return self.total_nbytes
+        return self.total_nbytes+self.max_nbytes
     @property
     def span(self):
         return self.frames[-1][0]-self.frames[0][0] if len(self.frames)>1 else 0.0

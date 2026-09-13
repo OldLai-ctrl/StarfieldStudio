@@ -20,6 +20,7 @@ DEFAULTS=dict(exposure=100.,gain=1.,input_bits=16,compute_device='自动（优�
               contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',
               curve_shadows=0.,curve_darks=0.,curve_lights=0.,curve_highlights=0.,
               curve_points=DEFAULT_CURVE_POINTS,
+              denoise_mode='关闭',denoise_amount=50.,
               trigger_condition='关闭',trigger_threshold=20.,trigger_mode='积分')
 
 class CaptureWorker(threading.Thread):
@@ -92,9 +93,11 @@ class CaptureWorker(threading.Thread):
             if 'window_frames' in new:
                 new['window_frames']=int(new['window_frames'])
                 if not 1<=new['window_frames']<=100000:raise ValueError('滚动窗口帧数需在1—100000之间')
+            if 'mode' in new and new['mode'] not in ('关闭','平均','积分','最大值'):
+                raise ValueError('滚动处理模式无效')
             if 'trigger_condition' in new and new['trigger_condition'] not in ('关闭','平均亮度低于','平均亮度高于'):
                 raise ValueError('亮度触发条件无效')
-            if 'trigger_mode' in new and new['trigger_mode'] not in ('关闭','平均','积分'):
+            if 'trigger_mode' in new and new['trigger_mode'] not in ('关闭','平均','积分','最大值'):
                 raise ValueError('亮度触发模式无效')
             if 'trigger_threshold' in new and (not np.isfinite(new['trigger_threshold']) or not 0<=float(new['trigger_threshold'])<=100):
                 raise ValueError('亮度触发阈值需在0—100%之间')
@@ -104,6 +107,9 @@ class CaptureWorker(threading.Thread):
             if 'custom_points' in new:new['custom_points']=validate_points(new['custom_points'])
             if 'curve_points' in new:new['curve_points']=validate_curve_points(new['curve_points'])
             if 'curve_mode' in new and new['curve_mode'] not in CURVE_MODES:raise ValueError('未知曲线模式')
+            if 'denoise_mode' in new and new['denoise_mode'] not in DENOISE_MODES:raise ValueError('未知即时降噪模式')
+            if 'denoise_amount' in new and (not np.isfinite(new['denoise_amount']) or not 0<=float(new['denoise_amount'])<=100):
+                raise ValueError('即时降噪强度需在0—100%之间')
             for name,low,high in [('contrast',-100,100),('sharpen',0,300),('sharpen_radius',.1,20),
                                   ('curve_shadows',-100,100),('curve_darks',-100,100),
                                   ('curve_lights',-100,100),('curve_highlights',-100,100)]:
@@ -130,6 +136,8 @@ class CaptureWorker(threading.Thread):
             if 'compute_device' in new:
                 self.compute.set_mode(new['compute_device']);self.roll.set_backend(self.compute)
                 self.event('log',text='计算设备：'+self.compute.label)
+            max_enabled=proposed['mode']=='最大值' or proposed['trigger_mode']=='最大值'
+            self.roll.set_max_enabled(max_enabled)
             self.settings.update(new);self.roll.set_window(self.settings['window_unit'],self.settings['seconds'],self.settings['window_frames'])
             if 'ae_mode' in new:self.ae_status=new['ae_mode'];self.ae_previous=None
             if 'memory' in new:self.roll.set_budget(self.settings['memory'])
@@ -182,7 +190,8 @@ class CaptureWorker(threading.Thread):
             else:
                 s=self.settings
                 import cv2
-                rgb=display_rgb(self.processed,s['black'],s['white'],s['gamma'],s['palette'],max_width=30000,custom_points=s['custom_points'],
+                preview_result=apply_denoise(self.processed,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
+                rgb=display_rgb(preview_result,s['black'],s['white'],s['gamma'],s['palette'],max_width=30000,custom_points=s['custom_points'],
                                 contrast=s['contrast'],sharpen=s['sharpen'],sharpen_radius=s['sharpen_radius'],
                                 curve_mode=s['curve_mode'],curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
                                 curve_points=s['curve_points'])
@@ -219,11 +228,12 @@ class CaptureWorker(threading.Thread):
             if s['math_op']=='窗口积分':total=self.roll.result('积分')*(meta.exposure_ms/100)
             else:avg=self.roll.result('平均')*(meta.exposure_ms/100)
         result=pixel_math(result,s,avg,total,self.reference,self.window_local);self.processed=result
-        counts,stats=histogram(result,'processed')
+        preview_result=apply_denoise(result,s.get('denoise_mode','关闭'),s.get('denoise_amount',0))
+        counts,stats=histogram(preview_result,'processed')
         raw_counts,raw_stats=histogram(raw,'sensor',meta.bits)
         if s['stretch']:
             s['black']=stats['p01'];s['white']=max(s['black']+1,stats['p995'])
-        view=result
+        view=preview_result
         if s.get('preview_crop'):
             x,y,cw,ch=s['preview_crop'];h,w=result.shape
             view=result[int(y*h):max(int(y*h)+1,int((y+ch)*h)),int(x*w):max(int(x*w)+1,int((x+cw)*w))]
@@ -249,6 +259,7 @@ class CaptureWorker(threading.Thread):
                 processed_shape=result.shape,mode=s['mode'],effective_mode=effective_mode,base_mode=s['mode'],
                 trigger_state=trigger_state,trigger_brightness=trigger_brightness,window_unit=s['window_unit'],window_frames=s['window_frames'],
                 auto=s['auto'],ae_mode=s['ae_mode'],ae_status=self.ae_status,math_op=s['math_op'],stretch=s['stretch'],
+                denoise_mode=s.get('denoise_mode','关闭'),denoise_amount=s.get('denoise_amount',0),
                 exposure=meta.exposure_ms,gain=meta.gain,bits=meta.bits,raw_limit=(1<<meta.bits)-1,raw_mean=raw_stats['mean'],raw_max=raw_stats['max'],
                 processed_dtype=str(result.dtype),processed_overflow=float(result.max())>(1<<meta.bits)-1,black=s['black'],white=s['white'],
                 memory=(self.roll.bytes+self.roll.total_bytes)/1024**2,compute_device=self.compute.label,compute_kind=self.compute.kind,

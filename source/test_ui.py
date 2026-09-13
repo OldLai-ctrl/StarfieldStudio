@@ -58,6 +58,9 @@ def test_auto_can_be_disabled_and_live_controls_apply():
         c=w.controls['mode'];i=c.findData('积分');c.setCurrentIndex(i);c.activated.emit(i)
         pump(app,lambda:w.latest['mode']=='积分')
         i=c.findData('平均');c.setCurrentIndex(i);c.activated.emit(i);pump(app,lambda:w.latest['mode']=='平均')
+        i=c.findData('最大值');c.setCurrentIndex(i);c.activated.emit(i);pump(app,lambda:w.latest['mode']=='最大值' and w.latest['effective_mode']=='最大值')
+        d=w.controls['denoise_mode'];d.setCurrentIndex(d.findData('中值 3×3（去孤立噪点）'));d.activated.emit(d.currentIndex())
+        w.controls['denoise_amount'].slider.setValue(3000);pump(app,lambda:w.worker.settings['denoise_mode'].startswith('中值') and w.worker.settings['denoise_amount']>29)
         c=w.controls['resolution'];c.setCurrentIndex(1);c.activated.emit(1)
         pump(app,lambda:w.latest['shape']==(960,1280))
         assert not w.worker.settings['auto']

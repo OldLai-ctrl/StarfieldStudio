@@ -62,6 +62,15 @@ def test_display_adjustments_change_preview_without_touching_input():
     assert not np.array_equal(base,adjusted)
     np.testing.assert_array_equal(image,original)
 
+def test_live_denoise_is_low_cost_and_preview_only():
+    image=np.full((21,21),100,dtype=np.float32);image[10,10]=10000;original=image.copy()
+    median=apply_denoise(image,'中值 3×3（去孤立噪点）',100)
+    soft=apply_denoise(image,'中值 3×3（去孤立噪点）',25)
+    gaussian=apply_denoise(image,'高斯 3×3（轻度平滑）',50)
+    assert median[10,10]==100 and 100<soft[10,10]<10000 and gaussian[10,10]<10000
+    np.testing.assert_array_equal(image,original)
+    np.testing.assert_array_equal(apply_denoise(image,'关闭',100),image)
+
 def test_local_window_replaces_only_selected_region():
     w=CaptureWorker();w.meta=FrameMeta();w.raw=np.ones((4,4),np.uint16);w.single=np.ones((4,4),np.float32)
     w.settings.update(mode='关闭',math_op='窗口积分',math_roi=(.5,.5,.5,.5));w.window_local=True

@@ -218,7 +218,7 @@ class PaletteDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Starfield Studio 2.3 | 工业黑白相机直播');self.resize(1430,920)
+        super().__init__();self.setWindowTitle('Starfield Studio 2.4 | 工业黑白相机直播');self.resize(1430,920)
         self.worker=CaptureWorker();self.controls={};self.connected=False;self.recording=False;self.seen=0
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
         self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
@@ -321,18 +321,18 @@ class MainWindow(QMainWindow):
         f.addRow('窗口单位',self.combo('window_unit',[('按时间','时间'),('按帧数','帧数')]))
         f.addRow('窗口时长 / 秒',self.spin('seconds',.05,120,3,2))
         f.addRow('窗口帧数',self.spin('window_frames',1,100000,30,0))
-        f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分')]))
+        f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值')]))
         compute_combo=self.combo('compute_device',[(s,s) for s in DEVICE_CHOICES])
         compute_combo.setToolTip('自动优先使用 OpenCL GPU；GPU（OpenCL）适用于安装了驱动运行时的 NVIDIA 与 Intel 显卡。不可用时会自动回退 CPU。')
         f.addRow('计算设备',compute_combo)
         f.addRow('亮度触发条件',self.combo('trigger_condition',[(s,s) for s in ['关闭','平均亮度低于','平均亮度高于']]))
         f.addRow('触发阈值 / %',self.spin('trigger_threshold',0,100,20,1))
-        f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('关闭叠加 · 单帧','关闭')]))
+        f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值'),('关闭叠加 · 单帧','关闭')]))
         budget=self.spin('memory',0,65536,0,0);budget.setSpecialValueText('自动 · 按可用内存扩展')
         budget.setToolTip('0 为自动扩展，并给系统保留可用内存；大于0为手动硬上限。不会丢弃窗口内的帧。')
         f.addRow('缓存 / MB（0=自动）',budget)
         f.addRow(self.button('应用自动曝光 / 叠加',self.apply_processing,True))
-        note=QLabel('窗口可按时间或帧数限制；改变单位、时长或帧数后从下一帧重新计数。触发器使用当前窗口全部帧的平均亮度，达到条件时切换到指定模式。');note.setWordWrap(True);f.addRow(note)
+        note=QLabel('窗口可按时间或帧数限制；改变单位、时长或帧数后从下一帧重新计数。最大值模式逐像素保留窗口内最亮值，适合星点和流星；触发器使用当前窗口全部帧的平均亮度，达到条件时切换到指定模式。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'校正 / 显示')
         f=self.group('校正主帧',lay)
@@ -367,6 +367,10 @@ class MainWindow(QMainWindow):
         self.curve_widget=CurveWidget();f.addRow(self.curve_widget)
         f.addRow(self.button('应用显示设置',self.apply_display))
         note=QLabel('调整只作用于预览、OBS 和预览 PNG，不改动原始 TIFF／SER／FITS。Camera Raw 参数曲线按阴影、暗部、亮部、高光分区调整；点曲线可编辑输入—输出控制点。锐化采用实时反遮罩，半径越大影响范围越宽。');note.setWordWrap(True);f.addRow(note)
+        f=self.group('即时降噪 · 仅预览 / OBS',lay)
+        f.addRow('降噪模式',self.combo('denoise_mode',[(s,s) for s in DENOISE_MODES]))
+        f.addRow('降噪强度',self.slider('denoise_amount',0,100,50,1,'%'))
+        note=QLabel('采用低开销的局部滤波，不增加滚动缓存。中值 3×3 更适合去除孤立热像素；高斯 3×3 更适合轻度压低随机噪声。强度为0等同关闭。单像素星点可能被中值滤波削弱，拍摄星点或流星时建议关闭或使用较低强度。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'像素运算')
         f=self.group('局部像素运算 · 默认关闭',lay)
@@ -445,7 +449,7 @@ class MainWindow(QMainWindow):
         self.worker.send('settings',values=v)
     def apply_display(self):
         v=self.values(['stretch','black','white','gamma','palette','contrast','sharpen','sharpen_radius','curve_mode',
-                       'curve_shadows','curve_darks','curve_lights','curve_highlights','curve_points'])
+                       'curve_shadows','curve_darks','curve_lights','curve_highlights','curve_points','denoise_mode','denoise_amount'])
         if not v['stretch'] and v['white']<=v['black']:self.show_error('亮点必须大于暗点');return
         self.worker.send('settings',values=v)
     def edit_palette(self):
@@ -600,7 +604,9 @@ class MainWindow(QMainWindow):
             configured_text='单帧' if d['mode']=='关闭' else '滚动'+d['mode']
             self.live_label.setText(('模拟预览' if d['sim'] else '实际采集')+f"   ·   {d['shape'][1]} × {d['shape'][0]}   ·   {self.fps:.1f} 帧/秒   ·   {mode_text}")
             ae=d['ae_mode'];stretch='持续自动' if d['stretch'] else '固定'
-            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用')+'  ·  '+d.get('compute_device','CPU'))
+            denoise=d.get('denoise_mode','关闭')
+            if denoise!='关闭':denoise+=f" {d.get('denoise_amount',0):g}%"
+            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用')+'  ·  即时降噪：'+denoise+'  ·  '+d.get('compute_device','CPU'))
             trigger_line='' if configured_text==mode_text else f"\n设置模式  {configured_text}"
             overflow='；滚动积分超过原始范围属于浮点累加' if d.get('processed_overflow') and d.get('effective_mode')=='积分' else ''
             self.stats.setText(f"原始帧 Mono{d['bits']} · 有效范围 0—{d['raw_limit']} · 16 位容器\n原始均值  {d['raw_mean']:.1f} · 原始峰值  {d['raw_max']:.1f}\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}{trigger_line}\n窗口缓存  {d['frames']} 帧（{('时间' if d['window_unit']=='时间' else '帧数')}）\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n处理类型  {d['processed_dtype']}{overflow}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")

@@ -87,6 +87,9 @@ class ComputeEngine:
     def divide(self,left,scale):
         if self.use_gpu:return cv2.divide(left,float(scale))
         return np.asarray(left)/float(scale)
+    def maximum(self,left,right):
+        if self.use_gpu:return cv2.max(left,right)
+        return np.maximum(np.asarray(left),np.asarray(right))
 
 def available_label():
     return ComputeEngine.probe()['label']
