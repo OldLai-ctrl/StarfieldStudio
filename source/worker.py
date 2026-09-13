@@ -15,7 +15,10 @@ DEFAULTS=dict(exposure=100.,gain=1.,seconds=3.,mode='平均',software_bin=1,
               black=0.,white=8000.,gamma=1.,palette='灰度',stretch=False,memory=0,hist_source='相机原始灰度',
               ae_mode='手动',ae_gain_low=1.,ae_gain_high=257.,ae_roi=None,ae_show=True,
               custom_points=DEFAULT_POINTS,math_op='关闭',math_roi=None,math_show=True,
-              math_low=-1e9,math_high=1e9,math_k=1.,math_scale=65535.,math_clip_low=0.,math_clip_high=65535.)
+              math_low=-1e9,math_high=1e9,math_k=1.,math_scale=65535.,math_clip_low=0.,math_clip_high=65535.,
+              contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',
+              curve_shadows=0.,curve_darks=0.,curve_lights=0.,curve_highlights=0.,
+              curve_points=DEFAULT_CURVE_POINTS)
 
 class CaptureWorker(threading.Thread):
     def __init__(self):
@@ -80,6 +83,13 @@ class CaptureWorker(threading.Thread):
             for name in ('ae_roi','math_roi'):
                 if name in new:new[name]=validate_roi(new[name])
             if 'custom_points' in new:new['custom_points']=validate_points(new['custom_points'])
+            if 'curve_points' in new:new['curve_points']=validate_curve_points(new['curve_points'])
+            if 'curve_mode' in new and new['curve_mode'] not in CURVE_MODES:raise ValueError('未知曲线模式')
+            for name,low,high in [('contrast',-100,100),('sharpen',0,300),('sharpen_radius',.1,20),
+                                  ('curve_shadows',-100,100),('curve_darks',-100,100),
+                                  ('curve_lights',-100,100),('curve_highlights',-100,100)]:
+                if name in new and (not np.isfinite(new[name]) or not low<=float(new[name])<=high):
+                    raise ValueError(f'{name}超出允许范围')
             if 'math_op' in new and new['math_op'] not in MATH_OPS:raise ValueError('未知像素运算')
             if new.get('math_op') in REF_OPS and self.reference is None:raise ValueError('请先点击“记录参考帧”，再选择参考帧运算')
             proposed={**self.settings,**new}
@@ -149,7 +159,10 @@ class CaptureWorker(threading.Thread):
             else:
                 s=self.settings
                 import cv2
-                rgb=display_rgb(self.processed,s['black'],s['white'],s['gamma'],s['palette'],max_width=30000,custom_points=s['custom_points'])
+                rgb=display_rgb(self.processed,s['black'],s['white'],s['gamma'],s['palette'],max_width=30000,custom_points=s['custom_points'],
+                                contrast=s['contrast'],sharpen=s['sharpen'],sharpen_radius=s['sharpen_radius'],
+                                curve_mode=s['curve_mode'],curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
+                                curve_points=s['curve_points'])
                 ok,data=cv2.imencode('.png',cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR))
                 if not ok:raise ValueError('PNG 编码失败')
                 data.tofile(path)
@@ -178,11 +191,17 @@ class CaptureWorker(threading.Thread):
         if s.get('preview_crop'):
             x,y,cw,ch=s['preview_crop'];h,w=result.shape
             view=result[int(y*h):max(int(y*h)+1,int((y+ch)*h)),int(x*w):max(int(x*w)+1,int((x+cw)*w))]
-        rgb=display_rgb(view,s['black'],s['white'],s['gamma'],s['palette'],custom_points=s['custom_points'])
+        rgb=display_rgb(view,s['black'],s['white'],s['gamma'],s['palette'],custom_points=s['custom_points'],
+                        contrast=s['contrast'],sharpen=s['sharpen'],sharpen_radius=s['sharpen_radius'],
+                        curve_mode=s['curve_mode'],curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
+                        curve_points=s['curve_points'])
         hs=s['hist_source']
         if hs in ('原始16位','相机原始灰度'):counts,hstats=histogram(raw,'sensor',meta.bits)
         elif hs=='显示灰度':
-            gray=display_rgb(view,s['black'],s['white'],s['gamma'],'灰度')[:,:,0]
+            gray=display_rgb(view,s['black'],s['white'],s['gamma'],'灰度',contrast=s['contrast'],sharpen=s['sharpen'],
+                             sharpen_radius=s['sharpen_radius'],curve_mode=s['curve_mode'],
+                             curve_params=(s['curve_shadows'],s['curve_darks'],s['curve_lights'],s['curve_highlights']),
+                             curve_points=s['curve_points'])[:,:,0]
             counts,hstats=histogram(gray,'display')
         else:hstats=stats
         white=s['custom_points'][-1][0] if s['palette']=='自定义' else s['white']

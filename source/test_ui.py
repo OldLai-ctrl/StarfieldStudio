@@ -18,8 +18,11 @@ def test_controls_preview_pause_config_crop(tmp_path,monkeypatch):
         w.source.setCurrentIndex(1);w.connect_btn.click()
         pump(app,lambda:w.latest is not None)
         assert w.connected and '640' in w.live_label.text()
+        w.controls['curve_mode'].setCurrentIndex(w.controls['curve_mode'].findData('Camera Raw 参数曲线'));w.controls['curve_mode'].activated.emit(w.controls['curve_mode'].currentIndex())
+        w.controls['contrast'].slider.setValue(1700);pump(app,lambda:abs(w.worker.settings['contrast']-70)<.2)
+        assert w.curve_widget.mode=='Camera Raw 参数曲线'
         w.controls['seconds'].setValue(.25);w.apply_processing()
-        w.set_crop((.1,.1,.5,.5));n=w.seen;pump(app,lambda:w.seen>n+2)
+        w.set_crop((.1,.1,.5,.5));pump(app,lambda:w.worker.settings.get('preview_crop') is not None);n=w.seen;pump(app,lambda:w.seen>n+2)
         assert w.output.pix.width()==320 and w.output.pix.height()==240
         w.clear_crop();n=w.seen;pump(app,lambda:w.seen>n+2)
         assert w.output.pix.width()==640

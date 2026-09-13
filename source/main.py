@@ -26,6 +26,84 @@ QToolBar {spacing:8px;padding:7px;border-bottom:1px solid #354154;}
 QCheckBox {spacing:7px;} QStatusBar {background:#1c2938;}
 '''
 
+class SliderControl(QWidget):
+    """A compact continuous slider with a precise numeric readout."""
+    valueChanged=Signal(float)
+    editingFinished=Signal()
+    def __init__(self,low,high,value,decimals=1,suffix=''):
+        super().__init__();self._low=float(low);self._high=float(high);self._guard=False
+        self.slider=QSlider(Qt.Orientation.Horizontal);self.spin=QDoubleSpinBox()
+        self.spin.setRange(self._low,self._high);self.spin.setDecimals(decimals);self.spin.setSingleStep(10**(-decimals));self.spin.setValue(value)
+        if suffix:self.spin.setSuffix(suffix)
+        self._set_slider_steps()
+        row=QHBoxLayout(self);row.setContentsMargins(0,0,0,0);row.setSpacing(6);row.addWidget(self.slider,1);row.addWidget(self.spin)
+        self.slider.valueChanged.connect(self._slider_changed);self.spin.valueChanged.connect(self._spin_changed);self.spin.editingFinished.connect(self.editingFinished)
+        self.setValue(value)
+    def _set_slider_steps(self):
+        self._steps=max(1000,int(round((self._high-self._low)*10**self.spin.decimals())))
+        self.slider.setRange(0,self._steps)
+    def _to_position(self,value):
+        return int(round((float(value)-self._low)/(self._high-self._low)*self._steps)) if self._high>self._low else 0
+    def _from_position(self,value):return self._low+(self._high-self._low)*int(value)/self._steps
+    def _slider_changed(self,value):
+        if self._guard:return
+        self._guard=True;self.spin.setValue(self._from_position(value));self._guard=False;self.valueChanged.emit(self.value())
+    def _spin_changed(self,value):
+        if self._guard:return
+        self._guard=True;self.slider.setValue(self._to_position(value));self._guard=False;self.valueChanged.emit(float(value))
+    def value(self):return float(self.spin.value())
+    def setValue(self,value):
+        self._guard=True;self.spin.setValue(float(value));self.slider.setValue(self._to_position(value));self._guard=False
+    def setRange(self,low,high):
+        self._guard=True;self._low=float(low);self._high=float(high);self.spin.setRange(self._low,self._high);self._set_slider_steps();self.slider.setValue(self._to_position(self.spin.value()));self._guard=False
+    def setSingleStep(self,step):self.spin.setSingleStep(step)
+    def hasFocus(self):return self.spin.hasFocus() or self.slider.hasFocus()
+    def blockSignals(self,block):
+        super().blockSignals(block);self.spin.blockSignals(block);self.slider.blockSignals(block)
+
+class CurveWidget(QWidget):
+    def __init__(self):
+        super().__init__();self.mode='关闭';self.params=(0.,0.,0.,0.);self.points=DEFAULT_CURVE_POINTS;self.setMinimumHeight(150);self.setToolTip('预览当前色调曲线；横轴为输入亮度，纵轴为输出亮度')
+    def set_curve(self,mode,params,points):self.mode=mode;self.params=tuple(params);self.points=points;self.update()
+    def paintEvent(self,e):
+        p=QPainter(self);p.fillRect(self.rect(),QColor('#0e151e'));r=self.rect().adjusted(30,12,-15,-26)
+        p.setPen(QPen(QColor('#293c4b'),1))
+        for i in range(5):
+            x=r.left()+r.width()*i/4;y=r.top()+r.height()*i/4;p.drawLine(int(x),r.top(),int(x),r.bottom());p.drawLine(r.left(),int(y),r.right(),int(y))
+        p.setPen(QPen(QColor('#68798a'),1,Qt.PenStyle.DashLine));p.drawLine(r.bottomLeft(),r.topRight())
+        grid=np.linspace(0,1,256)
+        if self.mode=='Camera Raw 参数曲线':vals=camera_raw_curve(grid,*self.params)
+        elif self.mode=='点曲线':
+            try:pts=validate_curve_points(self.points);vals=np.interp(grid,[x for x,y in pts],[y for x,y in pts])
+            except Exception:vals=grid
+        else:vals=grid
+        path=QPainterPath();path.moveTo(r.left(),r.bottom()-float(vals[0])*r.height())
+        for x,y in zip(grid[1:],vals[1:]):path.lineTo(r.left()+float(x)*r.width(),r.bottom()-float(y)*r.height())
+        p.setPen(QPen(QColor('#f0c56c') if self.mode!='关闭' else QColor('#6f8798'),2));p.drawPath(path)
+        p.setPen(QColor('#99aabe'));p.drawText(4,self.height()-8,'输出');p.drawText(self.width()-32,self.height()-8,'输入')
+
+class CurveDialog(QDialog):
+    def __init__(self,points,parent=None):
+        super().__init__(parent);self.setWindowTitle('点曲线 · Camera Raw 风格');self.resize(560,480)
+        layout=QVBoxLayout(self);note=QLabel('编辑输入亮度到输出亮度的控制点。输入和输出均为百分比；曲线自动在点之间平滑插值。参数曲线模式可直接使用主界面的四个滑块。');note.setWordWrap(True);layout.addWidget(note)
+        self.table=QTableWidget(0,2);self.table.setHorizontalHeaderLabels(['输入亮度 %','输出亮度 %']);self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch);layout.addWidget(self.table,1)
+        for x,y in points:self.add_point(x,y)
+        row=QHBoxLayout();add=QPushButton('添加控制点');add.clicked.connect(lambda:self.add_point(.5,.5));row.addWidget(add);delete=QPushButton('删除选中行');delete.clicked.connect(lambda:self.table.removeRow(self.table.currentRow()));row.addWidget(delete);layout.addLayout(row)
+        self.graph=CurveWidget();self.graph.set_curve('点曲线',(),points);layout.addWidget(self.graph)
+        self.table.itemChanged.connect(lambda *_:self.refresh())
+        buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(self.accept);buttons.rejected.connect(self.reject);layout.addWidget(buttons)
+    def add_point(self,x,y):
+        i=self.table.rowCount();self.table.insertRow(i);self.table.setItem(i,0,QTableWidgetItem(f'{float(x)*100:g}'));self.table.setItem(i,1,QTableWidgetItem(f'{float(y)*100:g}'))
+    def points(self):
+        return validate_curve_points([[float(self.table.item(i,0).text())/100,float(self.table.item(i,1).text())/100] for i in range(self.table.rowCount())])
+    def refresh(self):
+        try:self.graph.set_curve('点曲线',(),self.points())
+        except Exception:pass
+    def accept(self):
+        try:self.points()
+        except Exception as e:QMessageBox.warning(self,'曲线无效',str(e));return
+        super().accept()
+
 class Preview(QGraphicsView):
     cropChanged=Signal(object)
     regionSelected=Signal(str,object)
@@ -139,16 +217,17 @@ class PaletteDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Starfield Studio 2.0 | 工业黑白相机直播');self.resize(1430,920)
+        super().__init__();self.setWindowTitle('Starfield Studio 2.1 | 工业黑白相机直播');self.resize(1430,920)
         self.worker=CaptureWorker();self.controls={};self.connected=False;self.recording=False;self.seen=0
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
-        self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points')}
+        self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
         self.output=OutputWindow();self.output.hide()
         self.build();self.set_values(DEFAULTS);self.wire_controls();self.worker.start();self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(50)
     def wire_controls(self):
         for key,c in self.controls.items():
             if isinstance(c,QCheckBox):c.clicked.connect(lambda checked=False,k=key:self.commit_control(k))
             elif isinstance(c,QComboBox):c.activated.connect(lambda index,k=key:self.commit_control(k))
+            elif isinstance(c,SliderControl):c.valueChanged.connect(lambda value,k=key:self.commit_control(k))
             else:c.editingFinished.connect(lambda k=key:self.commit_control(k))
     def commit_control(self,key):
         v=self.values([key])
@@ -163,10 +242,13 @@ class MainWindow(QMainWindow):
             self.show_error('亮点必须大于暗点');return
         self.worker.send('settings',values=v)
         if key in ('ae_show','math_show'):self.refresh_regions()
+        if key=='curve_mode' or key.startswith('curve_'):self.refresh_curve()
         self.statusBar().showMessage('正在应用设置；右侧显示实际输出状态')
     def spin(self,key,low,high,value,decimals=2):
         c=QDoubleSpinBox();c.setRange(low,high);c.setDecimals(decimals);c.setValue(value);c.setKeyboardTracking(False)
         self.controls[key]=c;return c
+    def slider(self,key,low,high,value,decimals=1,suffix=''):
+        c=SliderControl(low,high,value,decimals,suffix);self.controls[key]=c;return c
     def check(self,key,text,value=False):
         c=QCheckBox(text);c.setChecked(value);self.controls[key]=c;return c
     def combo(self,key,values):
@@ -256,8 +338,19 @@ class MainWindow(QMainWindow):
         f.addRow('伽马',self.spin('gamma',.05,10,1,2))
         f.addRow('伪彩',self.combo('palette',[(s,s) for s in ['灰度','火焰','青蓝','科学色','自定义']]))
         f.addRow(self.button('编辑自定义灰度—颜色…',self.edit_palette))
+        f=self.group('实时图像调整 · 仅预览 / OBS',lay)
+        f.addRow('对比度',self.slider('contrast',-100,100,0,1,'%'))
+        f.addRow('锐化强度',self.slider('sharpen',0,300,0,1,'%'))
+        f.addRow('锐化半径',self.slider('sharpen_radius',.1,20,1,2,' px'))
+        f.addRow('曲线模式',self.combo('curve_mode',[(s,s) for s in CURVE_MODES]))
+        f.addRow('阴影',self.slider('curve_shadows',-100,100,0,1,'%'))
+        f.addRow('暗部',self.slider('curve_darks',-100,100,0,1,'%'))
+        f.addRow('亮部',self.slider('curve_lights',-100,100,0,1,'%'))
+        f.addRow('高光',self.slider('curve_highlights',-100,100,0,1,'%'))
+        f.addRow(self.button('编辑点曲线…',self.edit_curve))
+        self.curve_widget=CurveWidget();f.addRow(self.curve_widget)
         f.addRow(self.button('应用显示设置',self.apply_display))
-        note=QLabel('按黑白相机设计。亮暗平衡为显示黑白点，不包含彩色相机的通道白平衡。');note.setWordWrap(True);f.addRow(note)
+        note=QLabel('调整只作用于预览、OBS 和预览 PNG，不改动原始 TIFF／SER／FITS。Camera Raw 参数曲线按阴影、暗部、亮部、高光分区调整；点曲线可编辑输入—输出控制点。锐化采用实时反遮罩，半径越大影响范围越宽。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'像素运算')
         f=self.group('局部像素运算 · 默认关闭',lay)
@@ -314,6 +407,7 @@ class MainWindow(QMainWindow):
             else:c.setValue(v)
             c.blockSignals(False)
         if hasattr(self,'preview'):self.refresh_regions()
+        if hasattr(self,'curve_widget'):self.refresh_curve()
     def choose_dll(self):
         filename=BACKENDS[self.backend.currentData()][1]
         p,_=QFileDialog.getOpenFileName(self,'选择官方 x64 相机接口','',f'接口文件 ({filename})')
@@ -333,13 +427,24 @@ class MainWindow(QMainWindow):
         if v['ae_low']>v['ae_high']:self.show_error('最短曝光不能大于最长曝光');return
         self.worker.send('settings',values=v)
     def apply_display(self):
-        v=self.values(['stretch','black','white','gamma','palette'])
+        v=self.values(['stretch','black','white','gamma','palette','contrast','sharpen','sharpen_radius','curve_mode',
+                       'curve_shadows','curve_darks','curve_lights','curve_highlights','curve_points'])
         if not v['stretch'] and v['white']<=v['black']:self.show_error('亮点必须大于暗点');return
         self.worker.send('settings',values=v)
     def edit_palette(self):
         d=PaletteDialog(self.advanced['custom_points'],self)
         if d.exec()==QDialog.DialogCode.Accepted:
             v={'custom_points':d.points(),'palette':'自定义'};self.set_values(v);self.worker.send('settings',values=v)
+    def edit_curve(self):
+        d=CurveDialog(self.advanced['curve_points'],self)
+        if d.exec()==QDialog.DialogCode.Accepted:
+            v={'curve_points':d.points(),'curve_mode':'点曲线'};self.set_values(v);self.worker.send('settings',values=v)
+    def refresh_curve(self):
+        if not hasattr(self,'curve_widget'):return
+        p=tuple(self.controls[k].value() for k in ('curve_shadows','curve_darks','curve_lights','curve_highlights'))
+        mode=self.controls['curve_mode'].currentData();self.curve_widget.set_curve(mode,p,self.advanced['curve_points'])
+        active=mode=='Camera Raw 参数曲线'
+        for k in ('curve_shadows','curve_darks','curve_lights','curve_highlights'):self.controls[k].setEnabled(active)
     def capture_master(self,kind):
         if not self.connected:self.show_error('请先连接相机');return
         if self.source.currentIndex()==0:
@@ -379,6 +484,7 @@ class MainWindow(QMainWindow):
             for k,v in vals.items():
                 if k in ('ae_roi','math_roi'):validate_roi(v);continue
                 if k=='custom_points':validate_points(v);continue
+                if k=='curve_points':validate_curve_points(v);continue
                 if k in ('resolution','native_bin'):
                     if v is not None and not isinstance(v,int):raise ValueError('分辨率配置无效')
                     continue

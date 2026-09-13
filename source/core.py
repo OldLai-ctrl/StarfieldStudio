@@ -156,14 +156,27 @@ def exposure_target(current, measured, target, low, high, allowed=None):
         desired=min(candidates,key=lambda v:abs(np.log(v/max(desired,.001))))
     return desired
 
-def display_rgb(a,black=0,white=65535,gamma=1,palette='灰度',max_width=1920,custom_points=None):
+def display_rgb(a,black=0,white=65535,gamma=1,palette='灰度',max_width=1920,custom_points=None,
+                contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',curve_params=None,curve_points=None):
+    """Convert a processed mono frame to the preview image and apply display-only adjustments."""
     if a.shape[1]>max_width:
         a=cv2.resize(a,(max_width,max(1,round(a.shape[0]*max_width/a.shape[1]))),interpolation=cv2.INTER_AREA)
+    from processing import apply_display_adjustments,DEFAULT_CURVE_POINTS
     if palette=='自定义':
-        from processing import custom_color,DEFAULT_POINTS
-        return custom_color(a,custom_points if custom_points is not None else DEFAULT_POINTS)
+        from processing import custom_color,DEFAULT_POINTS,validate_points
+        points=custom_points if custom_points is not None else DEFAULT_POINTS
+        points=tuple(points)
+        # Custom pseudo-color retains its absolute gray control points. New tone
+        # adjustments operate within that LUT's input range so existing palettes
+        # keep their meaning when all adjustment sliders are at zero.
+        lo,hi=validate_points(points)[0][0],validate_points(points)[-1][0]
+        z=np.clip((a-lo)/max(hi-lo,1),0,1)
+        z=apply_display_adjustments(z,contrast,sharpen,sharpen_radius,curve_mode,curve_params,curve_points)
+        return custom_color(z*(hi-lo)+lo,points)
     x=np.clip((a-black)/max(white-black,1),0,1)
     x=np.power(x,1/max(gamma,.05))
+    x=apply_display_adjustments(x,contrast,sharpen,sharpen_radius,curve_mode,curve_params,
+                                curve_points if curve_points is not None else DEFAULT_CURVE_POINTS)
     gray=np.ascontiguousarray(np.rint(x*255).astype(np.uint8))
     maps={'火焰':cv2.COLORMAP_INFERNO,'青蓝':cv2.COLORMAP_OCEAN,'科学色':cv2.COLORMAP_VIRIDIS}
     if palette in maps:return cv2.cvtColor(cv2.applyColorMap(gray,maps[palette]),cv2.COLOR_BGR2RGB)

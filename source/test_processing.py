@@ -44,6 +44,24 @@ def test_window_reference_and_nonlinear_math_preserve_values():
     np.testing.assert_array_equal(pixel_math(a,{'math_op':'平方根','math_scale':1}),[[-2,0],[2,3]])
     assert np.isfinite(pixel_math(a,{'math_op':'对数'})).all()
 
+def test_camera_raw_curve_and_point_curve_are_bounded_and_continuous():
+    x=np.linspace(0,1,257,dtype=np.float32)
+    np.testing.assert_allclose(apply_tone_curve(x,'关闭'),x)
+    param=apply_tone_curve(x,'Camera Raw 参数曲线',(65,-30,25,-70))
+    points=apply_tone_curve(x,'点曲线',points=((0.,0.),(.25,.1),(.5,.7),(.75,.8),(1.,1.)))
+    assert param.min()>=0 and param.max()<=1 and points.min()>=0 and points.max()<=1
+    assert param[1] != x[1] and points[64] < x[64]
+
+def test_display_adjustments_change_preview_without_touching_input():
+    from core import display_rgb
+    image=np.tile(np.linspace(0,1000,64,dtype=np.float32),(64,1))
+    original=image.copy()
+    base=display_rgb(image,white=1000)
+    adjusted=display_rgb(image,white=1000,contrast=80,sharpen=180,sharpen_radius=2,
+                         curve_mode='Camera Raw 参数曲线',curve_params=(30,0,0,-20))
+    assert not np.array_equal(base,adjusted)
+    np.testing.assert_array_equal(image,original)
+
 def test_local_window_replaces_only_selected_region():
     w=CaptureWorker();w.meta=FrameMeta();w.raw=np.ones((4,4),np.uint16);w.single=np.ones((4,4),np.float32)
     w.settings.update(mode='关闭',math_op='窗口积分',math_roi=(.5,.5,.5,.5));w.window_local=True

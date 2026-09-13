@@ -9,6 +9,8 @@ REF_OPS={'减去参考帧','加上参考帧','与参考帧平均'}
 MATH_OPS=['关闭','加常数','乘系数','窗口平均','窗口积分','减去窗口平均','加上窗口平均',
           '减去参考帧','加上参考帧','与参考帧平均','幂律','对数','平方根','绝对值','限制范围']
 DEFAULT_POINTS=[[0,'#000000'],[1000,'#143d8f'],[4000,'#23cda8'],[16000,'#ffe56c'],[65535,'#ffffff']]
+DEFAULT_CURVE_POINTS=[[0.,0.],[.25,.25],[.5,.5],[.75,.75],[1.,1.]]
+CURVE_MODES=('关闭','Camera Raw 参数曲线','点曲线')
 
 def validate_roi(roi):
     if roi is None:return None
@@ -87,6 +89,70 @@ def custom_color(image,points):
     coordinates=np.empty((*index.shape,2),np.int16)
     coordinates[:,:,0]=index&255;coordinates[:,:,1]=index>>8
     return cv2.remap(lut.reshape(256,256,3),coordinates,None,cv2.INTER_NEAREST)
+
+def validate_curve_points(points):
+    """Validate a normalized point curve, keeping the endpoints pinned to 0 and 1."""
+    if not isinstance(points,(list,tuple)) or not 2<=len(points)<=32:
+        raise ValueError('曲线需要2至32个控制点')
+    result=[]
+    for point in points:
+        if not isinstance(point,(list,tuple)) or len(point)!=2:
+            raise ValueError('曲线控制点格式无效')
+        x,y=map(float,point)
+        if not math.isfinite(x) or not math.isfinite(y) or not 0<=x<=1 or not 0<=y<=1:
+            raise ValueError('曲线控制点必须在0%至100%范围内')
+        result.append((x,y))
+    result.sort()
+    if any(result[i][0]==result[i-1][0] for i in range(1,len(result))):
+        raise ValueError('曲线控制点的输入值不能重复')
+    if abs(result[0][0])>1e-6 or abs(result[-1][0]-1)>1e-6:
+        raise ValueError('曲线必须从0%输入开始并在100%输入结束')
+    return tuple(result)
+
+def camera_raw_curve(x,shadows=0.,darks=0.,lights=0.,highlights=0.):
+    """A fast four-zone tone curve modeled on Camera Raw's parametric curve."""
+    x=np.asarray(x,dtype=np.float32)
+    shadow=np.square(np.clip(1-x/.25,0,1))
+    dark=np.square(np.clip(1-np.abs(x-.25)/.25,0,1))
+    light=np.square(np.clip(1-np.abs(x-.75)/.25,0,1))
+    highlight=np.square(np.clip((x-.75)/.25,0,1))
+    y=x + (.35*float(shadows)/100)*shadow + (.20*float(darks)/100)*dark
+    y=y + (.20*float(lights)/100)*light + (.35*float(highlights)/100)*highlight
+    return np.clip(y,0,1).astype(np.float32,copy=False)
+
+def apply_tone_curve(x,mode='关闭',params=None,points=None):
+    """Apply a normalized Camera Raw-like curve with a small cached-size LUT."""
+    if mode=='关闭':return np.asarray(x,dtype=np.float32)
+    arr=np.clip(np.asarray(x,dtype=np.float32),0,1)
+    grid_size=4097
+    grid=np.linspace(0,1,grid_size,dtype=np.float32)
+    if mode=='Camera Raw 参数曲线':
+        p=tuple(params or (0.,0.,0.,0.))
+        if len(p)!=4:raise ValueError('Camera Raw 曲线参数无效')
+        lut=camera_raw_curve(grid,*p)
+    elif mode=='点曲线':
+        pts=validate_curve_points(points if points is not None else DEFAULT_CURVE_POINTS)
+        lut=np.interp(grid,[p[0] for p in pts],[p[1] for p in pts]).astype(np.float32)
+    else:raise ValueError('未知曲线模式')
+    index=arr*(grid_size-1)
+    lo=np.floor(index).astype(np.int32)
+    hi=np.minimum(lo+1,grid_size-1)
+    frac=index-lo
+    return lut[lo]*(1-frac)+lut[hi]*frac
+
+def apply_display_adjustments(x,contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',curve_params=None,curve_points=None):
+    """Apply preview-only tone and unsharp adjustments to normalized luminance."""
+    out=np.clip(np.asarray(x,dtype=np.float32),0,1)
+    c=float(contrast)
+    if abs(c)>1e-6:
+        out=np.clip((out-.5)*(1+c/100.)+.5,0,1)
+    out=apply_tone_curve(out,curve_mode,curve_params,curve_points)
+    amount=float(sharpen)
+    if amount>1e-6:
+        radius=max(.1,float(sharpen_radius))
+        blur=cv2.GaussianBlur(out,(0,0),radius)
+        out=np.clip(out+(amount/100.)*(out-blur),0,1)
+    return out
 
 def pixel_math(base,settings,window_average=None,window_sum=None,reference=None,window_is_local=False):
     op=settings.get('math_op','关闭')
