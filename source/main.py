@@ -222,13 +222,19 @@ class MainWindow(QMainWindow):
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
         self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
         self.output=OutputWindow();self.output.hide()
-        self.build();self.set_values(DEFAULTS);self.wire_controls();self.worker.start();self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(50)
+        self._slider_timers={};self.build();self.set_values(DEFAULTS);self.wire_controls();self.worker.start();self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(50)
     def wire_controls(self):
         for key,c in self.controls.items():
             if isinstance(c,QCheckBox):c.clicked.connect(lambda checked=False,k=key:self.commit_control(k))
             elif isinstance(c,QComboBox):c.activated.connect(lambda index,k=key:self.commit_control(k))
-            elif isinstance(c,SliderControl):c.valueChanged.connect(lambda value,k=key:self.commit_control(k))
+            elif isinstance(c,SliderControl):c.valueChanged.connect(lambda value,k=key:self.queue_slider(k))
             else:c.editingFinished.connect(lambda k=key:self.commit_control(k))
+    def queue_slider(self,key):
+        if key.startswith('curve_'):self.refresh_curve()
+        timer=self._slider_timers.get(key)
+        if timer is None:
+            timer=QTimer(self);timer.setSingleShot(True);timer.setInterval(45);timer.timeout.connect(lambda k=key:self.commit_control(k));self._slider_timers[key]=timer
+        timer.start()
     def commit_control(self,key):
         v=self.values([key])
         if v[key] is None:return

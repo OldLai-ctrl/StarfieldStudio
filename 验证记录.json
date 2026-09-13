@@ -3,10 +3,10 @@
   "date": "2026-09-13",
   "positioning": "面向部分工业黑白相机",
   "backends": ["TUCam", "海康 MVS", "图谱 ToupCam"],
-  "automated_tests": {"passed": 38, "failed": 0, "seconds": 8.32},
+  "automated_tests": {"passed": 38, "failed": 0, "seconds": 7.88},
   "packaged_demo": {"exit_code": 0, "screenshot_created": true},
   "git_tree_export_demo": {"exit_code": 0, "screenshot_created": true, "native_pyd_files": 36},
-  "executable_sha256": "86E88FA8A176717F3DBA5F623DE0427B35B5718E36E86BEFF64095381F61DC79",
+  "executable_sha256": "AAEEBE0746C7BC596684B2AD890C89EF29C54245255762912EBF9C198A2C72C3",
   "coverage": ["模拟厂商接口连接与释放", "曝光和增益读回", "分辨率与原始灰度", "格式拒绝", "界面与配置", "图像处理与滚动窗口", "OBS纯画面窗口模拟行为"],
   "limitations": ["本次未完成三品牌实机验证", "本次未进行实际OBS推流", "支持范围以README及SDK接入说明为准，不能视为全部型号兼容认证"]
 }

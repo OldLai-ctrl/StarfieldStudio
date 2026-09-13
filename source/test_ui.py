@@ -22,7 +22,7 @@ def test_controls_preview_pause_config_crop(tmp_path,monkeypatch):
         w.controls['contrast'].slider.setValue(1700);pump(app,lambda:abs(w.worker.settings['contrast']-70)<.2)
         assert w.curve_widget.mode=='Camera Raw 参数曲线'
         w.controls['seconds'].setValue(.25);w.apply_processing()
-        w.set_crop((.1,.1,.5,.5));pump(app,lambda:w.worker.settings.get('preview_crop') is not None);n=w.seen;pump(app,lambda:w.seen>n+2)
+        w.set_crop((.1,.1,.5,.5));pump(app,lambda:w.worker.settings.get('preview_crop') is not None);pump(app,lambda:w.output.pix.width()==320 and w.output.pix.height()==240)
         assert w.output.pix.width()==320 and w.output.pix.height()==240
         w.clear_crop();n=w.seen;pump(app,lambda:w.seen>n+2)
         assert w.output.pix.width()==640
