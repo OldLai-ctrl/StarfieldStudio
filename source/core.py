@@ -45,7 +45,26 @@ class CalibrationLibrary:
         self.masters=[m for m in self.masters if not (m.kind==master.kind and self.compatible(m,master.meta,master.image.shape,True))]
         self.masters.append(master)
 
-    def correct(self, raw, meta, dark=False, bias=False, flat=False):
+    def correct(self, raw, meta, dark=False, bias=False, flat=False, backend=None):
+        if backend is not None and backend.use_gpu:
+            # Calibration masters are uploaded once and the arithmetic stays
+            # in the selected OpenCL device until the corrected frame is
+            # needed by the rolling window.
+            out=backend.upload(raw.astype(np.float32,copy=False))
+            if dark:
+                d=self.find('dark',meta,raw.shape,True)
+                if d is None: raise CalibrationError('没有匹配当前相机、分辨率、增益、曝光和温度的暗场；输出已冻结')
+                out=backend.subtract(out,backend.upload_cached(d.image))
+            elif bias:
+                b=self.find('bias',meta,raw.shape)
+                if b is None: raise CalibrationError('没有匹配的偏置帧；输出已冻结')
+                out=backend.subtract(out,backend.upload_cached(b.image))
+            if flat:
+                f=self.find('flat',meta,raw.shape)
+                if f is None: raise CalibrationError('没有匹配的平场；输出已冻结')
+                out=backend.divide(out,backend.upload_cached(f.image))
+            backend.note('GPU校正')
+            return backend.download(out).astype(np.float32,copy=False)
         out=raw.astype(np.float32)
         if dark:
             d=self.find('dark',meta,raw.shape,True)
@@ -133,7 +152,7 @@ class RollingIntegrator:
         self.auto=memory_mb==0
         self.limit=int((1024 if self.auto else memory_mb)*1024**2)
     def clear(self):
-        self.frames=deque(); self.total=None; self.total_nbytes=0; self._shape=None; self.bytes=0; self.last_time=None
+        self.frames=deque(); self.frame_means=deque(); self.total=None; self.total_nbytes=0; self._shape=None; self.bytes=0; self.last_time=None
         self.max_blocks=deque();self.max_nbytes=0
     def _max_reduce(self,values):
         if not values:return None
@@ -166,6 +185,11 @@ class RollingIntegrator:
     def _frame_nbytes(self,frame):
         if self.gpu:return int(np.prod(self._shape))*4
         return np.asarray(frame).nbytes
+    @staticmethod
+    def _sample_mean(frame):
+        arr=np.asarray(frame)
+        stride=max(1,int(np.ceil(np.sqrt(arr.size/200000))))
+        return float(np.mean(arr[::stride,::stride],dtype=np.float64))
     def _rebuild_max_blocks(self):
         self.max_blocks=deque();self.max_nbytes=0
         if not self.max_enabled:return
@@ -196,6 +220,10 @@ class RollingIntegrator:
             else:self.gpu=False
             return
         self.frames=frames
+        # Means are kept separately so adaptive stacking can choose a short
+        # suffix without downloading or re-scanning every cached frame.
+        if len(self.frame_means)!=len(frames):
+            self.frame_means=deque(self._sample_mean(frame) for _,frame in frames)
         # The OpenCL accumulator is float32; keeping that dtype during the
         # migration preserves its values and avoids doubling the cache budget
         # just because the driver was reset.
@@ -217,13 +245,13 @@ class RollingIntegrator:
                 old_stamp,old=self.frames[0]
                 updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
                 self._max_remove_oldest()
-                self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
+                self.frames.popleft();self.frame_means.popleft();self.total=updated;self.bytes-=frame_bytes
         else:
             while self.frames and self.frames[0][0]<=stamp-self.seconds+1e-9:
                 old_stamp,old=self.frames[0]
                 updated=self.backend.subtract(self.total,old) if self.gpu else self.total-old
                 self._max_remove_oldest()
-                self.frames.popleft();self.total=updated;self.bytes-=frame_bytes
+                self.frames.popleft();self.frame_means.popleft();self.total=updated;self.bytes-=frame_bytes
         a=self.backend.upload(prepared) if self.gpu else np.array(prepared,copy=True)
         new_block=self.max_enabled and (not self.max_blocks or len(self.max_blocks[-1]['frames'])>=self.max_block_size)
         if self.max_enabled and not new_block:
@@ -247,7 +275,7 @@ class RollingIntegrator:
                 self.max_blocks.append({'frames':deque([item]),'maximum':new_max});self.max_nbytes+=frame_bytes
             else:
                 self.max_blocks[-1]['frames'].append(item);self.max_blocks[-1]['maximum']=new_max
-        self.frames.append(item);self.total=updated;self.bytes+=frame_bytes;self.last_time=stamp
+        self.frames.append(item);self.frame_means.append(self._sample_mean(prepared));self.total=updated;self.bytes+=frame_bytes;self.last_time=stamp
     def push(self, frame, stamp):
         if self.last_time is not None and stamp<=self.last_time:
             raise ValueError('Frame timestamps must strictly increase')
@@ -279,6 +307,38 @@ class RollingIntegrator:
                 self._fallback_cpu(str(exc));total=self.total
         else:total=self.total
         return (total/(len(self.frames) if mode=='平均' else 1)).astype(np.float32)
+    def adaptive_result(self,target,scale=1.0):
+        """Return the shortest recent integral whose mean reaches ``target``.
+
+        Frames are stored in a common exposure scale.  ``scale`` converts the
+        cumulative value back to the current camera ADU scale for comparison.
+        The configured time/frame window remains the hard upper bound.
+        """
+        if self.total is None or not self.frames:return None,0,0.0
+        target=float(target);scale=float(scale)
+        if not np.isfinite(target) or target<0:raise ValueError('叠加目标亮度必须是非负有限数值')
+        cumulative=0.0;count=len(self.frame_means)
+        for index,mean in enumerate(reversed(self.frame_means),1):
+            cumulative+=float(mean)*scale
+            if cumulative>=target:
+                count=index;break
+        selected=list(self.frames)[-count:]
+        try:
+            if count==len(self.frames):
+                result=self.backend.download(self.total).astype(np.float32,copy=False) if self.gpu else np.asarray(self.total,dtype=np.float32)
+            elif count==1:
+                result=self.backend.download(selected[0][1]).astype(np.float32,copy=False) if self.gpu else np.asarray(selected[0][1],dtype=np.float32)
+            elif self.gpu:
+                value=self.backend.upload(np.zeros(self._shape,np.float32))
+                for _,frame in selected:value=self.backend.add(value,frame)
+                result=self.backend.download(value).astype(np.float32,copy=False)
+            else:
+                result=np.sum([frame for _,frame in selected],axis=0,dtype=np.float64).astype(np.float32)
+        except Exception as exc:
+            if not self.gpu:raise
+            self._fallback_cpu(str(exc));return self.adaptive_result(target,scale)
+        span=selected[-1][0]-selected[0][0] if len(selected)>1 else 0.0
+        return result,count,float(span)
     @property
     def total_shape(self):
         return self._shape
@@ -289,9 +349,13 @@ class RollingIntegrator:
     def span(self):
         return self.frames[-1][0]-self.frames[0][0] if len(self.frames)>1 else 0.0
 
-def bin_image(a,factor):
+def bin_image(a,factor,backend=None):
     if factor==1:return a
     h,w=a.shape; h-=h%factor; w-=w%factor
+    if backend is not None and backend.use_gpu:
+        value=backend.upload(a[:h,:w]);result=cv2.resize(value,(w//factor,h//factor),interpolation=cv2.INTER_AREA)
+        backend.note('GPU软件Binning')
+        return backend.download(result).astype(np.float32,copy=False)
     return cv2.resize(a[:h,:w],(w//factor,h//factor),interpolation=cv2.INTER_AREA)
 
 def exposure_target(current, measured, target, low, high, allowed=None):
@@ -306,10 +370,13 @@ def exposure_target(current, measured, target, low, high, allowed=None):
     return desired
 
 def display_rgb(a,black=0,white=65535,gamma=1,palette='灰度',max_width=1920,custom_points=None,
-                contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',curve_params=None,curve_points=None):
+                contrast=0.,sharpen=0.,sharpen_radius=1.,curve_mode='关闭',curve_params=None,curve_points=None,backend=None):
     """Convert a processed mono frame to the preview image and apply display-only adjustments."""
     if a.shape[1]>max_width:
-        a=cv2.resize(a,(max_width,max(1,round(a.shape[0]*max_width/a.shape[1]))),interpolation=cv2.INTER_AREA)
+        size=(max_width,max(1,round(a.shape[0]*max_width/a.shape[1])))
+        if backend is not None and backend.use_gpu:
+            a=backend.download(cv2.resize(backend.upload(a),size,interpolation=cv2.INTER_AREA)).astype(np.float32,copy=False);backend.note('GPU预览缩放')
+        else:a=cv2.resize(a,size,interpolation=cv2.INTER_AREA)
     from processing import apply_display_adjustments,DEFAULT_CURVE_POINTS
     if palette=='自定义':
         from processing import custom_color,DEFAULT_POINTS,validate_points
@@ -320,12 +387,12 @@ def display_rgb(a,black=0,white=65535,gamma=1,palette='灰度',max_width=1920,cu
         # keep their meaning when all adjustment sliders are at zero.
         lo,hi=validate_points(points)[0][0],validate_points(points)[-1][0]
         z=np.clip((a-lo)/max(hi-lo,1),0,1)
-        z=apply_display_adjustments(z,contrast,sharpen,sharpen_radius,curve_mode,curve_params,curve_points)
+        z=apply_display_adjustments(z,contrast,sharpen,sharpen_radius,curve_mode,curve_params,curve_points,backend)
         return custom_color(z*(hi-lo)+lo,points)
     x=np.clip((a-black)/max(white-black,1),0,1)
     x=np.power(x,1/max(gamma,.05))
     x=apply_display_adjustments(x,contrast,sharpen,sharpen_radius,curve_mode,curve_params,
-                                curve_points if curve_points is not None else DEFAULT_CURVE_POINTS)
+                                curve_points if curve_points is not None else DEFAULT_CURVE_POINTS,backend)
     gray=np.ascontiguousarray(np.rint(x*255).astype(np.uint8))
     maps={'火焰':cv2.COLORMAP_INFERNO,'青蓝':cv2.COLORMAP_OCEAN,'科学色':cv2.COLORMAP_VIRIDIS}
     if palette in maps:return cv2.cvtColor(cv2.applyColorMap(gray,maps[palette]),cv2.COLOR_BGR2RGB)

@@ -3,7 +3,7 @@ import sys, os, json, time, queue, copy
 from pathlib import Path
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QRectF, Signal
-from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QPainterPath, QAction, QFontDatabase, QFont, QLinearGradient
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QPainterPath, QAction, QFontDatabase, QFont, QLinearGradient, QIcon
 from PySide6.QtWidgets import *
 from worker import CaptureWorker, DEFAULTS
 from compute import DEVICE_CHOICES
@@ -16,6 +16,9 @@ QWidget { background:#141b25; color:#dce5ee; font-family:"Microsoft YaHei UI"; f
 QMainWindow,QGraphicsView { background:#0b1017; }
 QGroupBox { border:1px solid #344154; border-radius:6px; margin-top:12px; padding:12px 8px 8px; font-weight:600; }
 QGroupBox::title { subcontrol-origin:margin; left:10px; color:#8ddfd8; }
+QToolButton#sectionHeader { text-align:left; background:#1b2939; border:1px solid #344154; border-radius:6px; padding:7px 8px; color:#8ddfd8; font-weight:600; }
+QToolButton#sectionHeader:hover { background:#263d50; }
+QWidget#sectionBody { background:#141b25; border:1px solid #344154; border-top:0; border-bottom-left-radius:6px; border-bottom-right-radius:6px; }
 QPushButton { background:#263447; border:1px solid #415168; border-radius:4px; padding:7px 10px; }
 QPushButton:hover { background:#34526a; } QPushButton:disabled {color:#687383;}
 QPushButton#primary { background:#17796e; border-color:#31b8a5; font-weight:600; }
@@ -83,6 +86,20 @@ class CurveWidget(QWidget):
         p.setPen(QPen(QColor('#f0c56c') if self.mode!='关闭' else QColor('#6f8798'),2));p.drawPath(path)
         p.setPen(QColor('#99aabe'));p.drawText(4,self.height()-8,'输出');p.drawText(self.width()-32,self.height()-8,'输入')
 
+class CollapsibleGroup(QWidget):
+    """A form section whose body can be folded without losing its values."""
+    def __init__(self,title,parent=None):
+        super().__init__(parent);self.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Maximum)
+        self.header=QToolButton();self.header.setObjectName('sectionHeader');self.header.setText(title);self.header.setCheckable(True);self.header.setChecked(True)
+        self.header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon);self.header.setArrowType(Qt.ArrowType.DownArrow)
+        self.body=QWidget();self.body.setObjectName('sectionBody');self.body.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Maximum)
+        self.form=QFormLayout(self.body);self.form.setContentsMargins(10,8,10,10);self.form.setHorizontalSpacing(10);self.form.setVerticalSpacing(6)
+        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow);self.form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft|Qt.AlignmentFlag.AlignVCenter)
+        layout=QVBoxLayout(self);layout.setContentsMargins(0,6,0,0);layout.setSpacing(0);layout.addWidget(self.header);layout.addWidget(self.body)
+        self.header.toggled.connect(self.set_expanded)
+    def set_expanded(self,expanded):
+        self.body.setVisible(bool(expanded));self.header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow);self.adjustSize()
+
 class CurveDialog(QDialog):
     def __init__(self,points,parent=None):
         super().__init__(parent);self.setWindowTitle('点曲线 · Camera Raw 风格');self.resize(560,480)
@@ -112,7 +129,7 @@ class Preview(QGraphicsView):
         super().__init__();self.scene_=QGraphicsScene(self);self.setScene(self.scene_)
         self.item=self.scene_.addPixmap(QPixmap());self.fit=True;self.cropping=False;self.origin=None
         self.box=self.scene_.addRect(QRectF(),QPen(QColor('#53dcca'),2));self.box.setZValue(3)
-        self.selection_kind='crop';self.regions={};self.image_region=(0,0,1,1)
+        self.selection_kind='crop';self.regions={};self.image_region=(0,0,1,1);self.mirror_horizontal=False;self.mirror_vertical=False
         self.region_items={k:self.scene_.addRect(QRectF(),QPen(QColor(c),2,Qt.PenStyle.DashLine)) for k,c in [('ae','#52eac6'),('math','#ffc569')]}
         for r in self.region_items.values():r.setZValue(4)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -129,6 +146,11 @@ class Preview(QGraphicsView):
             roi,visible=self.regions.get(key,(None,False))
             if roi is None or not visible:item.hide();continue
             x,y,w,h=roi
+            # Regions are stored in raw-camera coordinates.  The preview is
+            # mirrored before cropping, so map the rectangle to display
+            # coordinates before drawing it over the visible image.
+            if self.mirror_horizontal:x=1-x-w
+            if self.mirror_vertical:y=1-y-h
             r=QRectF((x-cx)/cw*b.width(),(y-cy)/ch*b.height(),w/cw*b.width(),h/ch*b.height()).intersected(b)
             item.setRect(r);item.setVisible(not r.isEmpty())
     def wheelEvent(self,e):
@@ -218,12 +240,14 @@ class PaletteDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Starfield Studio 2.5 | 工业黑白相机直播');self.resize(1430,920)
-        self.worker=CaptureWorker();self.controls={};self.connected=False;self.recording=False;self.seen=0
+        super().__init__();self.setWindowTitle('Starfield Studio 2.6 | 工业黑白相机直播');self.resize(1430,920)
+        self.worker=CaptureWorker();self.controls={};self.sections={};self.connected=False;self.recording=False;self.seen=0
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
+        self.config_name='默认设置'
         self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
         self.output=OutputWindow();self.output.hide()
         self._slider_timers={};self.build();self.set_values(DEFAULTS);self.wire_controls();self.worker.start();self.timer=QTimer(self);self.timer.timeout.connect(self.poll);self.timer.start(50)
+        self._apply_status_timer=QTimer(self);self._apply_status_timer.setSingleShot(True);self._apply_status_timer.timeout.connect(self.statusBar().clearMessage)
     def wire_controls(self):
         for key,c in self.controls.items():
             if isinstance(c,QCheckBox):c.clicked.connect(lambda checked=False,k=key:self.commit_control(k))
@@ -247,10 +271,9 @@ class MainWindow(QMainWindow):
             self.show_error('最短曝光不能大于最长曝光');return
         if key in ('black','white') and self.controls['white'].value()<=self.controls['black'].value():
             self.show_error('亮点必须大于暗点');return
-        self.worker.send('settings',values=v)
-        if key in ('ae_show','math_show'):self.refresh_regions()
+        self.worker.send('settings',values=v);self.show_apply_status()
+        if key in ('ae_show','math_show','mirror_horizontal','mirror_vertical'):self.refresh_regions()
         if key=='curve_mode' or key.startswith('curve_'):self.refresh_curve()
-        self.statusBar().showMessage('正在应用设置；右侧显示实际输出状态')
     def spin(self,key,low,high,value,decimals=2):
         c=QDoubleSpinBox();c.setRange(low,high);c.setDecimals(decimals);c.setValue(value);c.setKeyboardTracking(False)
         self.controls[key]=c;return c
@@ -267,7 +290,13 @@ class MainWindow(QMainWindow):
         if primary:b.setObjectName('primary')
         return b
     def group(self,title,parent):
-        g=QGroupBox(title);f=QFormLayout(g);f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow);parent.addWidget(g);return f
+        g=CollapsibleGroup(title);self.sections[title]=g;parent.addWidget(g);return g.form
+    def show_apply_status(self):
+        self.statusBar().showMessage('设置已提交，等待设备确认');self._apply_status_timer.start(1800)
+    def set_config_indicator(self,name):
+        self.config_name=name or '默认设置'
+        if hasattr(self,'config_label'):
+            self.config_label.setText('配置：'+self.config_name)
     def page(self,tabs,title):
         w=QWidget();lay=QVBoxLayout(w);lay.setContentsMargins(8,6,8,8)
         scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(w);scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);tabs.addTab(scroll,title);return lay
@@ -280,8 +309,9 @@ class MainWindow(QMainWindow):
         self.rec_btn=self.button('录制原始 SER',self.record);bar.addWidget(self.rec_btn)
         bar.addWidget(self.button('OBS 纯画面',self.output.show,True))
         bar.addWidget(self.button('保存配置',self.save_config));bar.addWidget(self.button('加载配置',self.load_config))
+        self.config_label=QLabel('配置：默认设置');self.config_label.setStyleSheet('color:#a8c4d8;padding:0 8px;');self.config_label.setToolTip('当前界面所使用的配置文件；未加载文件时为默认设置。');bar.addWidget(self.config_label)
         split=QSplitter();self.setCentralWidget(split)
-        tabs=QTabWidget();tabs.setMinimumWidth(320);tabs.setMaximumWidth(420);split.addWidget(tabs)
+        tabs=QTabWidget();tabs.setMinimumWidth(430);tabs.setMaximumWidth(560);tabs.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Expanding);split.addWidget(tabs)
         lay=self.page(tabs,'相机 / 叠加')
         f=self.group('连接设备',lay)
         self.source=QComboBox();self.source.addItems(['工业黑白相机','模拟星野 · 用于试用'])
@@ -296,7 +326,7 @@ class MainWindow(QMainWindow):
         self.backend_note=QLabel('面向部分工业黑白相机；按接口读取实际能力。');self.backend_note.setWordWrap(True);f.addRow(self.backend_note)
         self.index=QSpinBox();self.index.setRange(0,15);f.addRow('设备序号',self.index)
         self.connect_btn=self.button('连接相机',self.connect_camera,True);f.addRow(self.connect_btn)
-        self.device_label=QLabel('尚未连接');self.device_label.setWordWrap(True);f.addRow(self.device_label)
+        self.device_label=QLabel('尚未连接');self.device_label.setWordWrap(True);self.device_label.setMinimumHeight(56);f.addRow(self.device_label)
         f=self.group('采集参数',lay)
         f.addRow('曝光 / ms',self.spin('exposure',.001,15000,100,3))
         f.addRow('增益 / 驱动单位',self.spin('gain',0,1000,1,3))
@@ -312,27 +342,30 @@ class MainWindow(QMainWindow):
         f.addRow('最长曝光 / ms',self.spin('ae_high',.001,15000,5000,3))
         f.addRow('最低增益',self.spin('ae_gain_low',0,1000,1,3))
         f.addRow('最高增益',self.spin('ae_gain_high',0,1000,257,3))
+        f.addRow(self.check('lock_exposure','锁定曝光时间（高优先级）',False))
+        f.addRow(self.check('lock_gain','锁定增益（高优先级）',False))
         f.addRow(self.button('在预览图框选测光区域',lambda:self.begin_region('ae')))
         f.addRow(self.button('恢复全画面测光',lambda:self.set_region('ae',None)))
         f.addRow(self.check('ae_show','显示测光选框',True))
         self.ae_roi_label=QLabel('测光：全画面');self.ae_roi_label.setWordWrap(True);f.addRow(self.ae_roi_label)
-        note=QLabel('先调优先项，到边界后再调另一项。测量选区原始灰度的90%分位；隐藏选框不改变测光。启用校正时只使用匹配档位。');note.setWordWrap(True);f.addRow(note)
+        note=QLabel('先调优先项，到边界后再调另一项。锁定项不会被自动曝光改动；两项都锁定时仅保持当前曝光和增益。测量选区原始灰度的90%分位；隐藏选框不改变测光。启用校正时只使用匹配档位。');note.setWordWrap(True);f.addRow(note)
         f=self.group('最近几秒 · 滚动处理',lay)
         f.addRow('窗口单位',self.combo('window_unit',[('按时间','时间'),('按帧数','帧数')]))
         f.addRow('窗口时长 / 秒',self.spin('seconds',.05,120,3,2))
         f.addRow('窗口帧数',self.spin('window_frames',1,100000,30,0))
-        f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值')]))
+        f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值'),('叠加至目标亮度','目标亮度')]))
+        f.addRow('叠加目标亮度 / %',self.spin('stack_target',.1,100,20,1))
         compute_combo=self.combo('compute_device',[(s,s) for s in DEVICE_CHOICES])
         compute_combo.setToolTip('自动优先使用 OpenCL GPU；GPU（OpenCL）适用于安装了驱动运行时的 NVIDIA 与 Intel 显卡。不可用时会自动回退 CPU。')
         f.addRow('计算设备',compute_combo)
         f.addRow('亮度触发条件',self.combo('trigger_condition',[(s,s) for s in ['关闭','平均亮度低于','平均亮度高于']]))
         f.addRow('触发阈值 / %',self.spin('trigger_threshold',0,100,20,1))
-        f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值'),('关闭叠加 · 单帧','关闭')]))
+        f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('窗口最大值 · 保留星点/流星','最大值'),('叠加至目标亮度','目标亮度'),('关闭叠加 · 单帧','关闭')]))
         budget=self.spin('memory',0,65536,0,0);budget.setSpecialValueText('自动 · 按可用内存扩展')
         budget.setToolTip('0 为自动扩展，并给系统保留可用内存；大于0为手动硬上限。不会丢弃窗口内的帧。')
         f.addRow('缓存 / MB（0=自动）',budget)
         f.addRow(self.button('应用自动曝光 / 叠加',self.apply_processing,True))
-        note=QLabel('窗口可按时间或帧数限制；改变单位、时长或帧数后从下一帧重新计数。最大值模式逐像素保留窗口内最亮值，适合星点和流星；触发器使用当前窗口全部帧的平均亮度，达到条件时切换到指定模式。');note.setWordWrap(True);f.addRow(note)
+        note=QLabel('窗口可按时间或帧数限制；改变单位、时长或帧数后从下一帧重新计数。目标亮度模式从最近帧向前取最短的积分后缀，叠加后的平均亮度达到目标即停止继续累加，窗口时长／帧数是上限；达不到目标时使用整个窗口。最大值模式逐像素保留窗口内最亮值，适合星点和流星；触发器使用当前窗口全部帧的平均亮度，达到条件时切换到指定模式。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'校正 / 显示')
         f=self.group('校正主帧',lay)
@@ -375,6 +408,10 @@ class MainWindow(QMainWindow):
         f.addRow('增强模式',self.combo('lowlight_mode',[(s,s) for s in LOWLIGHT_MODES]))
         f.addRow('增强强度',self.slider('lowlight_strength',0,100,50,1,'%'))
         note=QLabel('参考公开的弱光 ISP 思路：自适应提亮暗部，或加一层低开销局部降噪；“星点/流星保护”只在暗部提亮，尽量保持亮点和超出统计白点的流星。它不复制任何厂商闭源模型，也不改变原始帧、校正帧或滚动缓存。需要时间降噪时请配合上方滚动平均/积分；追踪流星建议使用窗口最大值并降低降噪强度。');note.setWordWrap(True);f.addRow(note)
+        f=self.group('画面方向 · 仅预览 / OBS',lay)
+        f.addRow(self.check('mirror_horizontal','左右镜像',False))
+        f.addRow(self.check('mirror_vertical','上下镜像',False))
+        note=QLabel('只改变预览、OBS 和预览 PNG 的方向，原始 TIFF、SER、FITS 及校正帧保持相机原始方向。测光和像素运算选框会自动换算回原始坐标，镜像后无需手动修正。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'像素运算')
         f=self.group('局部像素运算 · 默认关闭',lay)
@@ -395,22 +432,22 @@ class MainWindow(QMainWindow):
         note=QLabel('关闭叠加且未使用窗口运算时不缓存多帧。关闭叠加但局部使用窗口运算时，只缓存该选区。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         center=QWidget();cl=QVBoxLayout(center);cl.setContentsMargins(8,8,8,8)
-        self.live_label=QLabel('准备采集');self.live_label.setStyleSheet('color:#91e4d4;font-size:14px;');cl.addWidget(self.live_label)
-        self.capture_state=QLabel('');cl.addWidget(self.capture_state)
+        self.live_label=QLabel('准备采集');self.live_label.setWordWrap(True);self.live_label.setStyleSheet('color:#91e4d4;font-size:14px;');cl.addWidget(self.live_label)
+        self.capture_state=QLabel('');self.capture_state.setWordWrap(True);self.capture_state.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Maximum);cl.addWidget(self.capture_state)
         self.preview=Preview();self.preview.cropChanged.connect(self.set_crop);self.preview.regionSelected.connect(self.set_region);cl.addWidget(self.preview,1)
         row=QHBoxLayout();row.addWidget(self.button('适合窗口',self.preview.fit_image))
         row.addWidget(self.button('1:1 预览像素',self.one_to_one));row.addWidget(self.button('框选直播裁切',self.begin_crop))
         row.addWidget(self.button('取消裁切',self.clear_crop));cl.addLayout(row)
         self.caption=QLabel('滚轮缩放 · 拖动平移 · 裁切作用于预览和 OBS，不改变原始采集');self.caption.setWordWrap(True);cl.addWidget(self.caption)
         split.addWidget(center)
-        right=QWidget();right.setMinimumWidth(235);right.setMaximumWidth(290);rl=QVBoxLayout(right)
+        right=QWidget();right.setMinimumWidth(255);right.setMaximumWidth(340);right.setSizePolicy(QSizePolicy.Policy.Preferred,QSizePolicy.Policy.Expanding);rl=QVBoxLayout(right)
         rl.addWidget(QLabel('直方图来源'))
         rl.addWidget(self.combo('hist_source',[(s,s) for s in ['相机原始灰度','处理后','显示灰度']]))
         self.hist=Histogram();rl.addWidget(self.hist)
         self.stats=QLabel('等待有效图像');self.stats.setWordWrap(True);self.stats.setStyleSheet('line-height:1.5;');rl.addWidget(self.stats)
         note=QLabel('原始：按接口位深显示量程。处理后：包含负值及积分超量程，横轴自动扩展。显示灰度：伪彩前0–255。纵轴均为对数。');note.setWordWrap(True);rl.addWidget(note)
         rl.addWidget(QLabel('运行记录'));self.log=QPlainTextEdit();self.log.setReadOnly(True);self.log.setMaximumBlockCount(150);rl.addWidget(self.log,1)
-        split.addWidget(right);split.setSizes([345,800,255]);self.statusBar().showMessage('相机原始数据 → 校正 → 滚动处理 → 预览 / OBS')
+        split.addWidget(right);split.setSizes([480,900,300]);self.statusBar().showMessage('相机原始数据 → 校正 → 滚动处理 → 预览 / OBS')
     def values(self,keys):
         out={}
         for k in keys:
@@ -446,17 +483,17 @@ class MainWindow(QMainWindow):
         else:self.worker.send('connect',sim=self.source.currentIndex()==1,backend=self.backend.currentData(),dll=self.dll.text(),index=self.index.value())
     def apply_capture(self):
         v=self.values(['exposure','gain','input_bits','resolution','native_bin','software_bin']);v={k:x for k,x in v.items() if x is not None}
-        self.worker.send('settings',values=v)
+        self.worker.send('settings',values=v);self.show_apply_status()
     def apply_processing(self):
-        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','seconds','window_unit','window_frames','mode','compute_device','memory','trigger_condition','trigger_threshold','trigger_mode','dark','bias','flat'])
+        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','lock_exposure','lock_gain','seconds','window_unit','window_frames','mode','stack_target','compute_device','memory','trigger_condition','trigger_threshold','trigger_mode','dark','bias','flat'])
         if v['ae_low']>v['ae_high']:self.show_error('最短曝光不能大于最长曝光');return
-        self.worker.send('settings',values=v)
+        self.worker.send('settings',values=v);self.show_apply_status()
     def apply_display(self):
         v=self.values(['stretch','black','white','gamma','palette','contrast','sharpen','sharpen_radius','curve_mode',
                        'curve_shadows','curve_darks','curve_lights','curve_highlights','curve_points','denoise_mode','denoise_amount',
-                       'lowlight_mode','lowlight_strength'])
+                       'lowlight_mode','lowlight_strength','mirror_horizontal','mirror_vertical'])
         if not v['stretch'] and v['white']<=v['black']:self.show_error('亮点必须大于暗点');return
-        self.worker.send('settings',values=v)
+        self.worker.send('settings',values=v);self.show_apply_status()
     def edit_palette(self):
         d=PaletteDialog(self.advanced['custom_points'],self)
         if d.exec()==QDialog.DialogCode.Accepted:
@@ -476,6 +513,8 @@ class MainWindow(QMainWindow):
         frame_mode=self.controls['window_unit'].currentData()=='帧数'
         self.controls['window_frames'].setEnabled(frame_mode)
         self.controls['seconds'].setEnabled(not frame_mode)
+        stack_active=self.controls['mode'].currentData()=='目标亮度' or self.controls['trigger_mode'].currentData()=='目标亮度'
+        self.controls['stack_target'].setEnabled(stack_active)
         active=self.controls['trigger_condition'].currentData()!='关闭'
         for k in ('trigger_threshold','trigger_mode'):self.controls[k].setEnabled(active)
     def capture_master(self,kind):
@@ -500,7 +539,9 @@ class MainWindow(QMainWindow):
         p,_=QFileDialog.getSaveFileName(self,'保存配置','','JSON (*.json)')
         if p:
             Path(p).write_text(json.dumps(dict(version=1,settings=self.values(list(DEFAULTS)+['resolution','native_bin']),sdk=self.dll.text(),backend=self.backend.currentData()),ensure_ascii=False,indent=2),encoding='utf-8')
+            self.set_config_indicator(Path(p).stem)
             self.log.appendPlainText('配置已保存；校正库请另行保存。')
+            self.statusBar().showMessage('当前配置：'+Path(p).stem);self._apply_status_timer.start(2500)
     def load_config(self):
         p,_=QFileDialog.getOpenFileName(self,'加载配置','','JSON (*.json)')
         if not p:return
@@ -530,7 +571,9 @@ class MainWindow(QMainWindow):
             restored=self.values(DEFAULTS.keys());restored.update(self.values(['resolution','native_bin']))
             restored={k:v for k,v in restored.items() if k not in ('resolution','native_bin') or v is not None}
             self.worker.send('settings',values=restored)
+            self.set_config_indicator(Path(p).stem)
             self.log.appendPlainText('已加载配置，设备连接和校正库需单独选择。')
+            self.statusBar().showMessage('已加载配置：'+Path(p).stem);self._apply_status_timer.start(2500)
         except Exception as e:self.show_error(str(e))
     def begin_crop(self):
         self.preview.selection_kind='crop';self.preview.cropping=True;self.statusBar().showMessage('在图像上按住左键框选直播区域')
@@ -540,9 +583,18 @@ class MainWindow(QMainWindow):
     def set_region(self,kind,roi):
         if roi is not None and self.crop:
             x,y,w,h=self.crop;rx,ry,rw,rh=roi;roi=(x+rx*w,y+ry*h,rw*w,rh*h)
+        if roi is not None:
+            x,y,w,h=roi
+            # The drag rectangle is in the displayed (possibly mirrored)
+            # image.  Convert it back to raw coordinates for AE/math.
+            if self.controls['mirror_horizontal'].isChecked():x=1-x-w
+            if self.controls['mirror_vertical'].isChecked():y=1-y-h
+            roi=(x,y,w,h)
         key=kind+'_roi';roi=validate_roi(roi);self.advanced[key]=roi;self.worker.send('settings',values={key:roi});self.refresh_regions()
     def refresh_regions(self):
         self.preview.image_region=self.crop or (0,0,1,1)
+        self.preview.mirror_horizontal=self.controls['mirror_horizontal'].isChecked()
+        self.preview.mirror_vertical=self.controls['mirror_vertical'].isChecked()
         for key,label in [('ae',self.ae_roi_label),('math',self.math_roi_label)]:
             roi=self.advanced[key+'_roi'];self.preview.regions[key]=(roi,self.controls[key+'_show'].isChecked())
             label.setText(('测光' if key=='ae' else '运算区域')+'：'+('全画面' if roi is None else f'左 {roi[0]*100:.1f}% / 上 {roi[1]*100:.1f}% / 宽 {roi[2]*100:.1f}% / 高 {roi[3]*100:.1f}%'))
@@ -558,7 +610,7 @@ class MainWindow(QMainWindow):
         self.refresh_regions()
     def one_to_one(self):self.preview.fit=False;self.preview.resetTransform()
     def show_error(self,text):
-        self.log.appendPlainText('⚠ '+text);self.statusBar().showMessage(text);self.output.message='采集提示：'+text;self.output.update()
+        self._apply_status_timer.stop();self.log.appendPlainText('⚠ '+text);self.statusBar().showMessage(text);self.output.message='采集提示：'+text;self.output.update()
     def poll(self):
         while True:
             try:e=self.worker.events.get_nowait()
@@ -584,7 +636,7 @@ class MainWindow(QMainWindow):
             elif kind=='disconnected':
                 self.connected=False;self.connect_btn.setText('连接相机');self.live_label.setText('未连接');self.output.message='未连接相机';self.output.update()
                 self.source.setEnabled(True);self.index.setEnabled(True);self.backend.setEnabled(True);self.dll.setEnabled(True);self.controls['input_bits'].setEnabled(True);self.output.pix=QPixmap()
-            elif kind=='settings':self.set_values(e['values'])
+            elif kind=='settings':self.set_values(e['values']);self.statusBar().showMessage('设置已生效');self._apply_status_timer.start(1200)
             elif kind=='telemetry':
                 self.set_values({k:v for k,v in e['values'].items() if k in self.controls and not self.controls[k].hasFocus()})
             elif kind=='error':self.show_error(e['text'])
@@ -613,10 +665,16 @@ class MainWindow(QMainWindow):
             if denoise!='关闭':denoise+=f" {d.get('denoise_amount',0):g}%"
             lowlight=d.get('lowlight_mode','关闭')
             if lowlight!='关闭':lowlight+=f" {d.get('lowlight_strength',0):g}%"
-            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用')+'  ·  即时降噪：'+denoise+'  ·  弱光增强：'+lowlight+'  ·  '+d.get('compute_device','CPU'))
+            compute=d.get('compute_device','CPU')
+            if d.get('compute_kind')=='opencl':compute+=f" · GPU处理 {d.get('compute_gpu_operations',0)} 次"
+            locks=''
+            if d.get('lock_exposure'):locks+=' · 锁定曝光'
+            if d.get('lock_gain'):locks+=' · 锁定增益'
+            self.capture_state.setText('测光控制：'+d['ae_status']+locks+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用')+'  ·  即时降噪：'+denoise+'  ·  弱光增强：'+lowlight+'  ·  '+compute)
             trigger_line='' if configured_text==mode_text else f"\n设置模式  {configured_text}"
-            overflow='；滚动积分超过原始范围属于浮点累加' if d.get('processed_overflow') and d.get('effective_mode')=='积分' else ''
-            self.stats.setText(f"原始帧 Mono{d['bits']} · 有效范围 0—{d['raw_limit']} · 16 位容器\n原始均值  {d['raw_mean']:.1f} · 原始峰值  {d['raw_max']:.1f}\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}{trigger_line}\n窗口缓存  {d['frames']} 帧（{('时间' if d['window_unit']=='时间' else '帧数')}）\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n处理类型  {d['processed_dtype']}{overflow}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")
+            overflow='；滚动积分超过原始范围属于浮点累加' if d.get('processed_overflow') and d.get('effective_mode') in ('积分','目标亮度') else ''
+            stack_line='' if d.get('effective_mode') in ('关闭','平均','积分','最大值') else f"\n生效叠加  {d.get('stack_frames',d['frames'])} 帧 · {d.get('stack_span',d['span']):.2f} 秒 · 目标 {d.get('stack_target',20):g}%"
+            self.stats.setText(f"原始帧 Mono{d['bits']} · 有效范围 0—{d['raw_limit']} · 16 位容器\n原始均值  {d['raw_mean']:.1f} · 原始峰值  {d['raw_max']:.1f}\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}{trigger_line}{stack_line}\n窗口缓存  {d['frames']} 帧（{('时间' if d['window_unit']=='时间' else '帧数')}）\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n处理类型  {d['processed_dtype']}{overflow}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")
         if self.connected and self.last_stamp and not self.worker.paused and not self.master_active:
             elapsed=time.monotonic()-self.last_stamp
             expected=max(2.,self.controls['exposure'].value()/1000*3+1)
@@ -630,6 +688,10 @@ class MainWindow(QMainWindow):
 
 def main():
     app=QApplication(sys.argv)
+    icon_candidates=[Path(getattr(sys,'_MEIPASS',''))/'starfield.ico',Path(__file__).with_name('starfield.ico'),Path(sys.executable).parent/'starfield.ico']
+    for icon_path in icon_candidates:
+        if icon_path.exists():
+            app.setWindowIcon(QIcon(str(icon_path)));break
     for name in ('msyh.ttc','msyhbd.ttc'):
         p=Path(os.environ.get('WINDIR','C:/Windows'))/'Fonts'/name
         if p.exists():QFontDatabase.addApplicationFont(str(p))

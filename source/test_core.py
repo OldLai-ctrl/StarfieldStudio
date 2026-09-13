@@ -145,6 +145,16 @@ def test_switch_sum_mean_preserves_window_and_actual_exposure_scale():
     w.command('settings',{'values':{'mode':'平均'}})
     assert len(w.roll.frames)==2;np.testing.assert_equal(w.processed,200)
 
+def test_simulator_scene_change_keeps_rolling_window():
+    w=CaptureWorker();w.cam=SimCamera();w.meta=replace(w.cam.meta);w.roll.push(np.ones((2,2),np.float32),1);w.roll.push(np.full((2,2),2,np.float32),2)
+    w.command('scene',{'scene':'平场光源'})
+    assert len(w.roll.frames)==2 and w.cam.scene=='平场光源'
+
+def test_auto_or_manual_gain_change_does_not_restart_rolling_window():
+    w=CaptureWorker();w.cam=SimCamera();w.cam.start();w.meta=replace(w.cam.meta);w.roll.push(np.ones((2,2),np.float32),1);w.roll.push(np.full((2,2),2,np.float32),2)
+    w.command('settings',{'values':{'gain':2}})
+    assert len(w.roll.frames)==2 and w.cam.meta.gain==2
+
 def test_settings_ack_does_not_rewrite_other_controls():
     w=CaptureWorker();w.command('settings',{'values':{'mode':'积分'}})
     e=w.events.get_nowait();assert e['values']=={'mode':'积分'}

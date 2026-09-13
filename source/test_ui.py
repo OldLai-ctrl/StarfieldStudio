@@ -1,7 +1,9 @@
 import os
 os.environ['QT_QPA_PLATFORM']='offscreen'
 import time
+from pathlib import Path
 from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtGui import QIcon, QPixmap
 from main import MainWindow, STYLE
 
 def pump(app,condition,timeout=5):
@@ -13,11 +15,21 @@ def pump(app,condition,timeout=5):
 
 def test_controls_preview_pause_config_crop(tmp_path,monkeypatch):
     app=QApplication.instance() or QApplication([]);app.setStyleSheet(STYLE)
+    icon=QIcon(str(Path(__file__).with_name('starfield.ico')))
+    assert not icon.isNull() and {s.width() for s in icon.availableSizes()} >= {16,32,256}
     w=MainWindow();w.show()
     try:
         w.source.setCurrentIndex(1);w.connect_btn.click()
         pump(app,lambda:w.latest is not None)
         assert w.connected and '640' in w.live_label.text()
+        assert w.capture_state.wordWrap()
+        w.show_apply_status();assert '设置已提交' in w.statusBar().currentMessage()
+        w._apply_status_timer.timeout.emit();assert w.statusBar().currentMessage()==''
+        section=w.sections['连接设备'];section.header.click();app.processEvents();assert not section.body.isVisible()
+        section.header.click();app.processEvents();assert section.body.isVisible()
+        w.controls['mirror_horizontal'].click();pump(app,lambda:w.worker.settings['mirror_horizontal'])
+        pump(app,lambda:w.latest.get('mirror_horizontal'))
+        assert w.latest['mirror_horizontal']
         w.controls['curve_mode'].setCurrentIndex(w.controls['curve_mode'].findData('Camera Raw 参数曲线'));w.controls['curve_mode'].activated.emit(w.controls['curve_mode'].currentIndex())
         w.controls['contrast'].slider.setValue(1700);pump(app,lambda:abs(w.worker.settings['contrast']-70)<.2)
         assert w.curve_widget.mode=='Camera Raw 参数曲线'
@@ -32,12 +44,20 @@ def test_controls_preview_pause_config_crop(tmp_path,monkeypatch):
         n=w.seen;w.pause_btn.click();pump(app,lambda:w.seen>n)
         p=str(tmp_path/'config.json')
         monkeypatch.setattr(QFileDialog,'getSaveFileName',lambda *a,**k:(p,''))
-        w.save_config();w.controls['seconds'].setValue(8)
+        w.save_config();assert w.config_label.text()=='配置：config';w.controls['seconds'].setValue(8)
         monkeypatch.setattr(QFileDialog,'getOpenFileName',lambda *a,**k:(p,''))
-        w.load_config();assert w.controls['seconds'].value()==.25
+        w.load_config();assert w.controls['seconds'].value()==.25 and w.config_label.text()=='配置：config'
         w.output.show();app.processEvents();assert w.output.isVisible()
     finally:
         w.worker.send('quit');pump(app,lambda:not w.worker.is_alive());w.close();app.processEvents()
+
+def test_preview_region_mapping_follows_mirror_and_crop():
+    app=QApplication.instance() or QApplication([]);app.setStyleSheet(STYLE)
+    from main import Preview
+    view=Preview();view.item.setPixmap(QPixmap(100,100));view.image_region=(.25,0,.5,1);view.mirror_horizontal=True
+    view.regions['ae']=((.4,.1,.2,.2),True);view.draw_regions()
+    rect=view.region_items['ae'].rect()
+    assert abs(rect.x()-30)<.01 and abs(rect.y()-10)<.01 and abs(rect.width()-40)<.01 and abs(rect.height()-20)<.01
 
 def test_auto_can_be_disabled_and_live_controls_apply():
     app=QApplication.instance() or QApplication([]);w=MainWindow();w.show()

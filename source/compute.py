@@ -15,7 +15,7 @@ class ComputeEngine:
     def __init__(self,requested='自动（优先 GPU）'):
         self.requested=requested if requested in DEVICE_CHOICES else DEVICE_CHOICES[0]
         self.kind='cpu';self.label='CPU';self.reason='未启用 GPU'
-        self._cache={}
+        self._cache={};self.gpu_operations=0;self.last_operation=''
         self._probe()
     @staticmethod
     def probe():
@@ -46,7 +46,8 @@ class ComputeEngine:
     def use_gpu(self):return self.kind=='opencl'
     def status(self):
         return dict(requested=self.requested,kind=self.kind,label=self.label,reason=self.reason,
-                    vendor=self.device_info.get('vendor',''),name=self.device_info.get('name',''))
+                    vendor=self.device_info.get('vendor',''),name=self.device_info.get('name',''),
+                    gpu_operations=self.gpu_operations,last_operation=self.last_operation)
     def set_mode(self,requested):
         new=ComputeEngine(requested)
         changed=(new.kind!=self.kind or new.requested!=self.requested or new.label!=self.label)
@@ -62,33 +63,40 @@ class ComputeEngine:
         self.kind='cpu';self.label='CPU 回退';self.reason='OpenCL 运算失败，已回退 CPU'
         if reason:self.reason+='：'+str(reason)
         self._cache.clear()
+    def note(self,operation):
+        """Record a hardware operation for the live status panel."""
+        if self.use_gpu:
+            self.gpu_operations+=1;self.last_operation=str(operation)
     def upload(self,array):
         if not self.use_gpu:return np.asarray(array)
+        self.note('上传图像')
         return cv2.UMat(np.ascontiguousarray(array))
     def upload_cached(self,array):
         if not self.use_gpu:return np.asarray(array)
         key=(id(array),array.shape,str(array.dtype))
         value=self._cache.get(key)
         if value is None:
-            value=cv2.UMat(np.ascontiguousarray(array));self._cache[key]=value
+            self.note('上传校正帧');value=cv2.UMat(np.ascontiguousarray(array));self._cache[key]=value
         return value
     @staticmethod
     def download(value):
         return value.get() if isinstance(value,cv2.UMat) else np.asarray(value)
     def add(self,left,right):
-        if self.use_gpu:return cv2.add(left,right)
+        if self.use_gpu:self.note('GPU累加');return cv2.add(left,right)
         return np.asarray(left)+np.asarray(right)
     def subtract(self,left,right):
-        if self.use_gpu:return cv2.subtract(left,right)
+        if self.use_gpu:self.note('GPU相减');return cv2.subtract(left,right)
         return np.asarray(left)-np.asarray(right)
     def multiply(self,left,scale):
-        if self.use_gpu:return cv2.multiply(left,float(scale))
+        if self.use_gpu:self.note('GPU乘法');return cv2.multiply(left,float(scale))
         return np.asarray(left)*float(scale)
     def divide(self,left,scale):
-        if self.use_gpu:return cv2.divide(left,float(scale))
-        return np.asarray(left)/float(scale)
+        if self.use_gpu:
+            self.note('GPU除法')
+            return cv2.divide(left,scale if isinstance(scale,(cv2.UMat,np.ndarray)) else float(scale))
+        return np.asarray(left)/np.asarray(scale)
     def maximum(self,left,right):
-        if self.use_gpu:return cv2.max(left,right)
+        if self.use_gpu:self.note('GPU逐像素最大值');return cv2.max(left,right)
         return np.maximum(np.asarray(left),np.asarray(right))
 
 def available_label():
