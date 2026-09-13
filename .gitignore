@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.xml
+*.ser
+*.fits
+*.fit
+*.fts
+*.tif
+*.tiff
+captures/
+calibration/
+*.log

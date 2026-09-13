@@ -1,0 +1,16 @@
+Starfield Studio 是面向部分工业黑白相机的独立应用，不是任何相机厂商的官方产品。
+
+sdk/：Tucsen TUCam 官方原版 x64 运行库，版权属于原厂。
+来源：https://www.tucsen.com/uploads/TUCam_FV2.0.8.0_PV2.0.151.0-Setup.zip
+未修改原厂运行库、相机固件或已安装的相机驱动。
+
+海康 MVS：使用用户安装的官方完整开发包及其 MvImport 接口文件，不在本项目中重新分发。
+图谱 ToupCam：使用用户选择的官方 x64 toupcam.dll，不在本项目中重新分发。
+各厂商商标和接口名称仅用于识别兼容接口，版权与许可属于各原厂。
+
+应用依赖 Python、PySide6/Qt、Shiboken、NumPy、OpenCV 与 tifffile。
+已保留安装包提供的第三方许可及元数据，见 third-party/。
+应用源码见 source/；_internal/ 中的动态运行库可单独替换为兼容版本。
+
+开发打包时已排除无关工具的 ICU 运行库，Qt 使用 Windows 自带的对应组件。
+推荐在当前 Windows 11 64 位环境使用；未测试旧版 Windows。
