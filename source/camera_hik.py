@@ -8,7 +8,7 @@ import importlib
 import os, sys
 from pathlib import Path
 from core import FrameMeta
-from camera_common import check_value, check_readback, unpack_mono
+from camera_common import VALID_BITS, check_value, check_readback, unpack_mono
 
 MONO={0x01080001:8,0x01100003:10,0x01100005:12,0x01100025:14,0x01100007:16}
 
@@ -62,9 +62,13 @@ class HikCamera:
                 raise RuntimeError('海康设备提供彩色/Bayer 格式，当前版本仅接受黑白相机')
             formats=[v for v in supported if v in MONO]
             if not formats:raise RuntimeError('此海康相机未提供受支持的非压缩 Mono8/10/12/14/16 格式')
-            self.pixel=max(formats,key=MONO.get);self.check(self.cam.MV_CC_SetEnumValue('PixelFormat',self.pixel),'原始像素格式')
+            self.pixel_by_bits={}
+            for value in formats:self.pixel_by_bits.setdefault(MONO[value],value)
+            self.bit_options=[(bits,f'Mono{bits} · 原始') for bits in sorted(self.pixel_by_bits)]
+            self.input_bits=max(self.pixel_by_bits)
+            self.pixel=self.pixel_by_bits[self.input_bits];self.check(self.cam.MV_CC_SetEnumValue('PixelFormat',self.pixel),'原始像素格式')
             if self.enum('PixelFormat').nCurValue!=self.pixel:raise RuntimeError('海康像素格式读回不一致')
-            self.meta.bits=MONO[self.pixel]
+            self.meta.bits=self.input_bits
             self.ensure_manual();self.check(self.cam.MV_CC_SetEnumValue('TriggerMode',0),'连续采集')
             self.check(self.cam.MV_CC_SetEnumValue('AcquisitionMode',2),'连续采集模式')
             # Optional frame-rate limiting may be absent. Do not require it for cameras without this node.
@@ -109,10 +113,19 @@ class HikCamera:
         self.ensure_manual();self.check(self.cam.MV_CC_StartGrabbing(),'开始采集');self.active=True;self.discard=2
     def stop(self):
         if self.active:self.check(self.cam.MV_CC_StopGrabbing(),'停止采集');self.active=False
-    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None):
+    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None,input_bits=None):
         if native_bin is not None:raise ValueError('此海康接口使用软件 Binning')
+        if input_bits is not None:
+            input_bits=int(input_bits)
+            if input_bits not in self.pixel_by_bits:raise ValueError(f'海康相机不提供 Mono{input_bits}')
         was=self.active
         if was:self.stop()
+        if input_bits is not None and input_bits!=self.input_bits:
+            pixel=self.pixel_by_bits[input_bits]
+            self.check(self.cam.MV_CC_SetEnumValue('PixelFormat',pixel),'原始像素格式')
+            actual=self.enum('PixelFormat').nCurValue
+            if actual!=pixel:raise RuntimeError('海康像素位深读回不一致')
+            self.pixel=pixel;self.input_bits=input_bits;self.meta.bits=input_bits
         if resolution is not None:
             if not 0<=resolution<len(self.shapes):raise ValueError('无效画幅')
             for name in ('OffsetX','OffsetY'):

@@ -6,6 +6,7 @@ import os, sys, time
 import numpy as np
 import cv2
 from core import FrameMeta
+from camera_common import VALID_BITS, validate_native_frame
 
 I=C.c_int32; U=C.c_uint32; D=C.c_double; P=C.c_void_p
 class Init(C.Structure): _fields_=[('count',U),('host_index',I),('path',C.c_char_p)]
@@ -22,17 +23,31 @@ class Frame(C.Structure):
               ('index',U),('image_size',U),('reserved',U),('histogram_size',U),('buffer',P)]
 
 def decode_frame(f,acquisition_bits=None):
-    verified_raw16=(f.depth==2 and acquisition_bits==16 and f.format==0x10)
-    if f.element!=2 or f.channels!=1 or (f.depth<=8 and not verified_raw16):
-        raise RuntimeError(f'拒绝非高位深原始帧：depth={f.depth}, bytes={f.element}, channels={f.channels}。不会用8位图冒充16位采集。')
-    if not f.buffer or not (0<f.width<=30000 and 0<f.height<=30000) or f.stride<f.width*2:
+    # Keep the legacy strict check when callers do not identify the requested
+    # acquisition depth.  The camera adapter passes the selected native depth.
+    explicit_bits=acquisition_bits is not None
+    if acquisition_bits is None:
+        if f.element!=2 or f.channels!=1 or f.depth<=8:
+            raise RuntimeError(f'拒绝非高位深原始帧：depth={f.depth}, bytes={f.element}, channels={f.channels}。不会用8位图冒充16位采集。')
+        acquisition_bits=16
+    if acquisition_bits not in VALID_BITS:raise RuntimeError('TUCam 返回未知输入位深')
+    if explicit_bits and f.format!=0x10:
+        raise RuntimeError(f'拒绝非 RAW 格式帧：format=0x{f.format:02X}')
+    expected_bytes=1 if acquisition_bits==8 else 2
+    if f.channels!=1 or f.element not in (expected_bytes,2) or (acquisition_bits>8 and f.element!=2):
+        raise RuntimeError(f'拒绝与 Mono{acquisition_bits} 不符的原始帧：depth={f.depth}, bytes={f.element}, channels={f.channels}')
+    if acquisition_bits>8 and f.depth not in (2,16):
+        raise RuntimeError(f'拒绝未确认的 Mono{acquisition_bits} 帧：depth={f.depth}')
+    if not f.buffer or not (0<f.width<=30000 and 0<f.height<=30000) or f.stride<f.width*expected_bytes:
         raise RuntimeError('SDK 返回无效图像尺寸／缓冲区')
     if f.stride*f.height>512*1024**2:raise RuntimeError('SDK 帧尺寸超出安全范围')
     offset=int(f.offset)
     if offset<f.header:raise RuntimeError('SDK 图像偏移小于头部长度')
     # Respect SDK returned offset and row padding; never assume offset==1024.
     buf=(C.c_uint8*(f.stride*f.height)).from_address(int(f.buffer)+offset)
-    return np.ndarray((f.height,f.width),np.uint16,buffer=buf,strides=(f.stride,2)).copy()
+    dtype=np.uint8 if f.element==1 else np.uint16
+    result=np.ndarray((f.height,f.width),dtype,buffer=buf,strides=(f.stride,f.element)).astype(np.uint16,copy=True)
+    return validate_native_frame(result,acquisition_bits)
 
 class TucamCamera:
     def __init__(self,dll_path,index=0):
@@ -78,18 +93,26 @@ class TucamCamera:
             # Native binning is capability-based. Unsupported controls are not fabricated.
             self.bins=self.cap_options(0x26)
             options=self.cap_options(2)
-            candidates=[v for v,t in options if '16' in t]
-            # Some SDKs report literal bit counts, others enums. Require explicit text or literal.
-            if not candidates:candidates=[v for v,t in options if v==16]
-            if not candidates:raise RuntimeError(f'驱动未明确提供16位模式：{options}。请导出诊断核实，不自动退回8位。')
-            self.bit_mode=candidates[0]
+            import re
+            bit_modes={}
+            for value,text in options:
+                m=re.search(r'(?<!\d)(8|10|11|12|14|16)(?:\s*(?:bit|bits|位))?(?!\d)',text,re.I)
+                if m:bit_modes[int(m.group(1))]=value
+                elif value in VALID_BITS:bit_modes[int(value)]=value
+            if not bit_modes:raise RuntimeError(f'驱动未明确提供可切换位深：{options}')
+            self.bit_modes=bit_modes
+            self.bit_options=[(bits,f'Mono{bits} · 原始') for bits in sorted(bit_modes)]
+            self.input_bits=max(bit_modes)
+            self.bit_mode=bit_modes[self.input_bits]
             self.meta.exposure_ms=self.get_prop(1);self.meta.gain=self.get_prop(0)
             self.mode=self.get_cap(0);self.bin_value=self.get_cap(0x26,optional=True)
-            self.meta.mode=f'res={self.mode};bin={self.bin_value};raw16'
+            self.meta.bits=self.input_bits
+            self.meta.mode=f'res={self.mode};bin={self.bin_value};raw{self.input_bits}'
             # Some USB controls become writable only after stream initialization.
             self.start()
             if self.get_cap(2)!=self.bit_mode:
                 self.set_cap(2,self.bit_mode);self.stop();self.start()
+            self._read_bit_mode()
             self.set_cap(3,0)
             self.set_prop(1,min(max(100.,self.exp_range[0]),self.exp_range[1]))
             self.meta.exposure_ms=self.get_prop(1);self.meta.gain=self.get_prop(0);self.discard=2
@@ -124,11 +147,20 @@ class TucamCamera:
         if optional and r!=1:return None
         self.check(r,'读取模式');return v.value
     def set_cap(self,id,v):self.check(self.dll.TUCAM_Capa_SetValue(self.handle,id,v),'设置模式')
+    def _read_bit_mode(self):
+        actual=self.get_cap(2)
+        for bits,value in self.bit_modes.items():
+            if value==actual:
+                self.input_bits=bits;self.bit_mode=value;self.meta.bits=bits
+                return bits
+        raise RuntimeError(f'TUCam 位深模式读回不一致：{actual}，可用 {self.bit_modes}')
     def ensure_manual(self):
         self.set_cap(3,0)
         if self.get_cap(3)!=0:raise RuntimeError('相机自动曝光未能关闭，已停止使用未确认的参数')
     def start(self):
         if self.active:return
+        # TUCam's request field is the RAW format selector (0x10), not the
+        # sensor bit count; the selected bit depth is controlled by capability 2.
         self.frame=Frame();self.frame.requested=0x10;self.frame.reserved=1
         self.check(self.dll.TUCAM_Buf_Alloc(self.handle,C.byref(self.frame)),'分配原始缓冲区');self.allocated=True
         self.check(self.dll.TUCAM_Cap_Start(self.handle,0),'开始采集');self.active=True;self.last_index=None
@@ -140,15 +172,20 @@ class TucamCamera:
         if self.handle:
             if self.active:self.dll.TUCAM_Cap_Stop(self.handle);self.active=False
             if self.allocated:self.dll.TUCAM_Buf_Release(self.handle);self.allocated=False
-    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None):
+    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None,input_bits=None):
         running=self.active
-        format_change=(resolution is not None and resolution!=self.mode) or (native_bin is not None and native_bin!=self.bin_value)
+        if input_bits is not None:
+            input_bits=int(input_bits)
+            if input_bits not in self.bit_modes:raise ValueError(f'TUCam 不提供 Mono{input_bits}')
+        format_change=(resolution is not None and resolution!=self.mode) or (native_bin is not None and native_bin!=self.bin_value) or (input_bits is not None and input_bits!=self.input_bits)
         target_exp=self.meta.exposure_ms if exposure is None else exposure
         target_gain=self.meta.gain if gain is None else gain
         if running and format_change:self.stop()
         try:
             if resolution is not None:self.set_cap(0,resolution);self.mode=self.get_cap(0)
             if native_bin is not None:self.set_cap(0x26,native_bin);self.bin_value=self.get_cap(0x26)
+            if input_bits is not None and input_bits!=self.input_bits:
+                self.bit_mode=self.bit_modes[input_bits];self.set_cap(2,self.bit_mode);self._read_bit_mode()
             if running and format_change:self.start()
             self.ensure_manual()
             self.set_prop(1,target_exp);self.set_prop(0,target_gain)
@@ -157,7 +194,7 @@ class TucamCamera:
             if abs(self.meta.exposure_ms-target_exp)>max(self.exp_range[2]*1.1,.01):raise RuntimeError('曝光写入后读回不一致')
             if abs(self.meta.gain-target_gain)>max(self.gain_range[2]*1.1,.001):raise RuntimeError('增益写入后读回不一致')
             if resolution is not None and self.mode!=resolution:raise RuntimeError('分辨率设置未被相机接受')
-            self.meta.mode=f'res={self.mode};bin={self.bin_value};raw16'
+            self.meta.mode=f'res={self.mode};bin={self.bin_value};raw{self.input_bits}'
         finally:
             if running:self.start()
             self.discard=2
@@ -168,7 +205,7 @@ class TucamCamera:
         # A successful blocking WaitForFrame is the new-frame event; do not deduplicate by slot.
         self.last_index=self.frame.index
         if self.discard:self.discard-=1;return None
-        a=decode_frame(self.frame,16);self.meta.bits=16
+        a=decode_frame(self.frame,self.input_bits);self.meta.bits=self.input_bits
         import re
         label=next((t for v,t in self.resolutions if v==self.mode),'')
         dims=re.search(r'(\d+)\s*[x×]\s*(\d+)',label)
@@ -188,6 +225,9 @@ class SimCamera:
         self.name='模拟星野 · 非相机数据';self.meta=FrameMeta();self.exp_range=(.018,15000,.001)
         self.gain_range=(1,16,.1);self.resolutions=[(0,'640 × 480'),(1,'1280 × 960'),(2,'5472 × 3648')]
         self.bins=[];self.mode=0;self.bin_value=None;self.scene='星野';self.active=False
+        self.bit_options=[(8,'Mono8 · 模拟输入'),(14,'Mono14 · 模拟输入'),(16,'Mono16 · 模拟输入')]
+        self.input_bits=16
+        self.meta.bits=self.input_bits
         self.rng=np.random.default_rng(42);self.next=0;self.make_scene()
     def make_scene(self):
         w,h=[(640,480),(1280,960),(5472,3648)][self.mode]
@@ -199,10 +239,14 @@ class SimCamera:
         self.bias=(400+12*np.sin(x*80)).astype(np.float32)
         self.hot=np.zeros((h,w),np.float32)
         for _ in range(50):self.hot[self.rng.integers(h),self.rng.integers(w)]=self.rng.uniform(100,4000)
-    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None):
+    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None,input_bits=None):
         if exposure is not None:self.meta.exposure_ms=float(np.clip(exposure,*self.exp_range[:2]))
         if gain is not None:self.meta.gain=float(np.clip(gain,*self.gain_range[:2]))
         if resolution is not None:self.mode=resolution;self.make_scene()
+        if input_bits is not None:
+            input_bits=int(input_bits)
+            if input_bits not in [v for v,_ in self.bit_options]:raise ValueError('模拟器不提供所选输入位深')
+            self.input_bits=input_bits;self.meta.bits=input_bits
     def start(self):self.active=True;self.next=time.monotonic()
     def stop(self):self.active=False
     def close(self):self.stop()
@@ -215,7 +259,7 @@ class SimCamera:
         scale=self.meta.exposure_ms/100*self.meta.gain
         image=signal*self.flat*scale+self.bias+self.hot*self.meta.exposure_ms/1000
         noise=self.rng.normal(0,12*np.sqrt(self.meta.gain),image.shape).astype(np.float32)
-        return np.clip(image+noise,0,65535).astype(np.uint16)
+        return np.clip(image+noise,0,(1<<self.input_bits)-1).astype(np.uint16)
 
 def default_sdk():
     base=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent

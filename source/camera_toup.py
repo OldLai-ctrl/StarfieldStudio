@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import numpy as np
 from core import FrameMeta
-from camera_common import check_value, check_readback
+from camera_common import VALID_BITS, check_value, check_readback, validate_native_frame
 
 U=C.c_uint32; I=C.c_int32; P=C.c_void_p; US=C.c_uint16
 class Resolution(C.Structure):_fields_=[('width',U),('height',U)]
@@ -48,8 +48,13 @@ class ToupCamera:
             if not self.handle:raise RuntimeError('图谱相机打开失败，请关闭其他采集软件')
             if self.dll.Toupcam_get_MonoMode(self.handle)!=0:raise RuntimeError('图谱接口未确认黑白传感器')
             depth=self.dll.Toupcam_get_MaxBitDepth(self.handle)
-            if depth not in (8,10,11,12,14,16):raise RuntimeError('图谱接口返回未知位深')
-            self.call('put_Option',4,1);self.call('put_Option',6,int(depth>8))
+            if depth not in VALID_BITS:raise RuntimeError('图谱接口返回未知位深')
+            # ToupCam exposes 8-bit and the sensor's maximum RAW depth via
+            # TOUPCAM_OPTION_BITDEPTH (0/1).  Do not invent intermediate modes.
+            self.max_bits=depth;self.bit_options=[(8,'Mono8 · 原始')]
+            if depth!=8:self.bit_options.append((depth,f'Mono{depth} · 原始'))
+            self.input_bits=depth
+            self.call('put_Option',4,1);self.call('put_Option',6,int(self.input_bits>8))
             self.ensure_manual()
             # Remove trigger, ROI and SDK digital binning from previous client state.
             self.call('put_Option',0x0b,0)
@@ -81,7 +86,9 @@ class ToupCamera:
         lo,hi,default=US(),US(),US();self.call('get_ExpoAGainRange',C.byref(lo),C.byref(hi),C.byref(default));self.gain_range=(lo.value,hi.value,1)
         fourcc,bits=U(),U();self.call('get_RawFormat',C.byref(fourcc),C.byref(bits))
         if bits.value not in (8,10,11,12,14,16):raise RuntimeError('不支持当前图谱原始位深')
-        self.meta.bits=bits.value;self.meta.exposure_ms=self.get('get_ExpoTime',U)/1000;self.meta.gain=self.get('get_ExpoAGain',US)
+        if hasattr(self,'bit_options') and bits.value not in [v for v,_ in self.bit_options]:
+            raise RuntimeError(f'图谱接口返回未选择的原始位深 Mono{bits.value}')
+        self.meta.bits=bits.value;self.input_bits=bits.value;self.meta.exposure_ms=self.get('get_ExpoTime',U)/1000;self.meta.gain=self.get('get_ExpoAGain',US)
         w,h=I(),I();self.call('get_Size',C.byref(w),C.byref(h));self.shape=(h.value,w.value)
         if min(self.shape)<=0 or max(self.shape)>30000 or w.value*h.value*2>512*1024**2:raise RuntimeError('图谱帧尺寸无效')
         self.buffer=np.empty(self.shape,np.uint8 if bits.value==8 else np.uint16)
@@ -91,10 +98,17 @@ class ToupCamera:
         self.ensure_manual();self.call('StartPullModeWithCallback',None,None);self.active=True;self.discard=2
     def stop(self):
         if self.active:self.call('Stop');self.active=False
-    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None):
+    def configure(self,exposure=None,gain=None,resolution=None,native_bin=None,input_bits=None):
         if native_bin is not None:raise ValueError('此接口使用软件 Binning')
+        if input_bits is not None:
+            input_bits=int(input_bits)
+            if input_bits not in [v for v,_ in self.bit_options]:raise ValueError(f'图谱相机不提供 Mono{input_bits}')
         was=self.active
         if was:self.stop()
+        if input_bits is not None and input_bits!=self.input_bits:
+            self.call('put_Option',6,int(input_bits>8))
+            self.refresh()
+            if self.input_bits!=input_bits:raise RuntimeError(f'图谱位深读回不一致：请求 Mono{input_bits}，实际 Mono{self.input_bits}')
         if resolution is not None:
             if resolution not in [v for v,_ in self.resolutions]:raise ValueError('无效分辨率')
             self.call('put_eSize',resolution);self.mode=self.get('get_eSize',U)
@@ -114,7 +128,7 @@ class ToupCamera:
         if self.discard:self.discard-=1;return None
         if self.get('get_AutoExpoEnable',I)!=0:raise RuntimeError('图谱自动曝光状态发生变化')
         self.meta.exposure_ms=self.get('get_ExpoTime',U)/1000;self.meta.gain=self.get('get_ExpoAGain',US)
-        return self.buffer.astype(np.uint16,copy=True)
+        return validate_native_frame(self.buffer.astype(np.uint16,copy=True),self.input_bits)
     def close(self):
         try:
             if self.handle:

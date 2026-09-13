@@ -37,7 +37,7 @@ class FakeHik:
         v.nCurValue=self.enums[k];v.nSupportValue=[0x01080001,0x01100005] if k=='PixelFormat' else [0,1,2];v.nSupportedNum=len(v.nSupportValue);return 0
     def MV_CC_SetEnumValue(self,k,v):self.enums[k]=v;return 0
     def MV_CC_GetIntValue(self,k,v):
-        if k=='PayloadSize':self.ints[k]=self.ints['Width']*self.ints['Height']*2
+        if k=='PayloadSize':self.ints[k]=self.ints['Width']*self.ints['Height']*(1 if self.enums['PixelFormat']==0x01080001 else 2)
         v.nCurValue=self.ints[k];v.nMin=2;v.nInc=2;v.nMax={'Width':8,'Height':6}.get(k,1000);return 0
     def MV_CC_SetIntValue(self,k,v):self.ints[k]=v;return 0
     def MV_CC_GetFloatValue(self,k,v):
@@ -51,9 +51,11 @@ class FakeHik:
     def MV_CC_StopGrabbing(self):self.active=False;return 0
     def MV_CC_GetOneFrameTimeout(self,buffer,size,info,timeout):
         assert self.active and timeout>=3000
-        info.nWidth=self.ints['Width'];info.nHeight=self.ints['Height'];info.nFrameLen=info.nWidth*info.nHeight*2
+        info.nWidth=self.ints['Width'];info.nHeight=self.ints['Height'];info.nFrameLen=info.nWidth*info.nHeight*(1 if self.enums['PixelFormat']==0x01080001 else 2)
         info.enPixelType=0x01080009 if self.bad_frame else self.enums['PixelFormat']
-        a=np.ctypeslib.as_array(buffer).view('<u2');a[:]=4095;return 0
+        if self.enums['PixelFormat']==0x01080001:np.ctypeslib.as_array(buffer)[:]=255
+        else:np.ctypeslib.as_array(buffer).view('<u2')[:]=4095
+        return 0
 
 def hik_fixture(monkeypatch):
     device_type=type('Device',(C.Structure,),{'_fields_':[('unused',C.c_int)]})
@@ -82,6 +84,7 @@ def test_hik_connect_controls_roi_raw_and_cleanup(monkeypatch):
         assert frame.shape==cam.shape and frame.max()==4095
         fake.bad_frame=True
         with pytest.raises(RuntimeError,match='格式'):cam.read()
+        fake.bad_frame=False;cam.configure(input_bits=8);cam.read();cam.read();frame=cam.read();assert cam.meta.bits==8 and frame.max()==255
     finally:cam.close()
     assert fake.closed and fake.destroyed and not fake.active
 
@@ -100,7 +103,7 @@ class Function:
 class FakeToup:
     def __init__(self):
         self.model=toup.Model();self.model.flag=0x10;self.closed=False;self.active=False;self.mode=0;self.auto=1
-        self.exp=100000;self.gain=100;self.options={};self.ignore=False;self.calls=[]
+        self.exp=100000;self.gain=100;self.options={};self.ignore=False;self.calls=[];self.raw_bits=12
     def __getattr__(self,name):
         def fn(*a):
             op=name.removeprefix('Toupcam_');self.calls.append(op)
@@ -110,12 +113,14 @@ class FakeToup:
             if op=='get_MaxBitDepth':return 12
             if op=='get_ResolutionNumber':return 2
             if op=='get_MonoMode':return 0
-            if op=='put_Option':self.options[a[1]]=a[2]
+            if op=='put_Option':
+                self.options[a[1]]=a[2]
+                if a[1]==6:self.raw_bits=12 if a[2] else 8
             elif op=='put_AutoExpoEnable':self.auto=a[1]
             elif op=='get_AutoExpoEnable':a[1]._obj.value=self.auto
             elif op=='get_ExpTimeRange':a[1]._obj.value=5000;a[2]._obj.value=5000000
             elif op=='get_ExpoAGainRange':a[1]._obj.value=100;a[2]._obj.value=1000
-            elif op=='get_RawFormat':a[1]._obj.value=0x59595959;a[2]._obj.value=12
+            elif op=='get_RawFormat':a[1]._obj.value=0x59595959;a[2]._obj.value=self.raw_bits
             elif op=='get_ExpoTime':a[1]._obj.value=self.exp
             elif op=='get_ExpoAGain':a[1]._obj.value=self.gain
             elif op=='put_ExpoTime':self.exp=a[1]
@@ -130,7 +135,8 @@ class FakeToup:
             elif op=='WaitImageV3':
                 assert self.active and a[5]==-1
                 info=a[-1]._obj;info.width=8//(self.mode+1);info.height=6//(self.mode+1)
-                np.ctypeslib.as_array((C.c_uint16*(info.width*info.height)).from_address(a[2]))[:]=4095
+                if self.raw_bits==8:np.ctypeslib.as_array((C.c_uint8*(info.width*info.height)).from_address(a[2]))[:]=255
+                else:np.ctypeslib.as_array((C.c_uint16*(info.width*info.height)).from_address(a[2]))[:]=4095
             return 0
         return Function(fn)
 
@@ -142,6 +148,7 @@ def test_toup_raw_lifecycle_and_controls(monkeypatch,tmp_path):
         cam.start();cam.configure(exposure=5,gain=200,resolution=1)
         assert cam.shape==(3,4) and cam.meta.bits==12 and cam.meta.exposure_ms==5
         cam.read();cam.read();frame=cam.read();assert frame.max()==4095 and frame.dtype==np.uint16
+        cam.configure(input_bits=8);cam.read();cam.read();frame=cam.read();assert cam.meta.bits==8 and frame.max()==255
         fake.ignore=True
         with pytest.raises(RuntimeError,match='读回'):cam.configure(gain=300)
         assert not fake.active

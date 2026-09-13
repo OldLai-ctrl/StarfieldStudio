@@ -105,10 +105,23 @@ def physical_memory():
     return struct.unpack_from('QQ',buf,8)
 
 class RollingIntegrator:
-    """Strict (now-window, now] FIFO. Every unique acquired frame enters once."""
-    def __init__(self, seconds=3.0, memory_mb=768):
-        self.seconds=seconds; self.set_budget(memory_mb)
+    """Finite FIFO using either elapsed time or a fixed number of frames."""
+    def __init__(self, seconds=3.0, memory_mb=768, window_unit='时间', frame_limit=30):
+        self.seconds=float(seconds);self.window_unit='时间';self.frame_limit=int(frame_limit)
+        self.set_window(window_unit,seconds,frame_limit)
+        self.set_budget(memory_mb)
         self.clear()
+    def set_window(self,unit='时间',seconds=None,frames=None):
+        if unit not in ('时间','帧数'):raise ValueError('滚动窗口单位只能是时间或帧数')
+        if seconds is not None:
+            seconds=float(seconds)
+            if not np.isfinite(seconds) or seconds<=0:raise ValueError('窗口时长必须大于0秒')
+            self.seconds=seconds
+        if frames is not None:
+            frames=int(frames)
+            if frames<1:raise ValueError('窗口帧数必须至少为1')
+            self.frame_limit=frames
+        self.window_unit=unit
     def set_budget(self,memory_mb):
         self.auto=memory_mb==0
         self.limit=int((1024 if self.auto else memory_mb)*1024**2)
@@ -119,8 +132,12 @@ class RollingIntegrator:
             raise ValueError('Frame timestamps must strictly increase')
         if self.total is not None and self.total.shape!=frame.shape: self.clear()
         if self.total is None: self.total=np.zeros(frame.shape,np.float64)
-        while self.frames and self.frames[0][0]<=stamp-self.seconds+1e-9:
-            _,old=self.frames.popleft(); self.total-=old; self.bytes-=old.nbytes
+        if self.window_unit=='帧数':
+            while len(self.frames)>=self.frame_limit:
+                _,old=self.frames.popleft();self.total-=old;self.bytes-=old.nbytes
+        else:
+            while self.frames and self.frames[0][0]<=stamp-self.seconds+1e-9:
+                _,old=self.frames.popleft(); self.total-=old; self.bytes-=old.nbytes
         a=np.array(frame,dtype=np.float32,copy=True)
         required=self.bytes+a.nbytes+self.total.nbytes
         if required>self.limit and self.auto:
@@ -189,7 +206,7 @@ def histogram(a,domain='sensor',bits=16):
     elif domain=='display':low,high=0.,256.
     else:low,high=0.,float(1<<bits)
     counts,edges=np.histogram(vals,bins=256,range=(low,high))
-    return counts,dict(p01=float(np.percentile(vals,1)),p995=float(np.percentile(vals,99.5)),
+    return counts,dict(min=float(vals.min()),max=float(vals.max()),p01=float(np.percentile(vals,1)),p995=float(np.percentile(vals,99.5)),
                        hist_low=low,hist_high=high,hist_samples=int(vals.size),
                        mean=float(np.mean(vals)),saturation=float(np.mean(vals>=((1<<bits)-1))*100),
                        focus=float(cv2.Laplacian(vals.astype(np.float32),cv2.CV_32F).var()))

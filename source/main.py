@@ -217,7 +217,7 @@ class PaletteDialog(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__();self.setWindowTitle('Starfield Studio 2.1 | 工业黑白相机直播');self.resize(1430,920)
+        super().__init__();self.setWindowTitle('Starfield Studio 2.2 | 工业黑白相机直播');self.resize(1430,920)
         self.worker=CaptureWorker();self.controls={};self.connected=False;self.recording=False;self.seen=0
         self.crop=None;self.latest=None;self.last_stamp=0;self.fps=0;self.master_active=False
         self.advanced={k:copy.deepcopy(DEFAULTS[k]) for k in ('ae_roi','math_roi','custom_points','curve_points')}
@@ -299,6 +299,7 @@ class MainWindow(QMainWindow):
         f=self.group('采集参数',lay)
         f.addRow('曝光 / ms',self.spin('exposure',.001,15000,100,3))
         f.addRow('增益 / 驱动单位',self.spin('gain',0,1000,1,3))
+        f.addRow('输入位深',self.combo('input_bits',[('默认 Mono16',16)]))
         f.addRow('分辨率 / 相机合并',self.combo('resolution',[('连接后读取',None)]))
         f.addRow('相机 Binning',self.combo('native_bin',[('连接后读取',None)]))
         f.addRow('软件 Binning',self.combo('software_bin',[(f'{n} × {n} · 平均',n) for n in (1,2,3,4)]))
@@ -316,13 +317,18 @@ class MainWindow(QMainWindow):
         self.ae_roi_label=QLabel('测光：全画面');self.ae_roi_label.setWordWrap(True);f.addRow(self.ae_roi_label)
         note=QLabel('先调优先项，到边界后再调另一项。测量选区原始灰度的90%分位；隐藏选框不改变测光。启用校正时只使用匹配档位。');note.setWordWrap(True);f.addRow(note)
         f=self.group('最近几秒 · 滚动处理',lay)
+        f.addRow('窗口单位',self.combo('window_unit',[('按时间','时间'),('按帧数','帧数')]))
         f.addRow('窗口时长 / 秒',self.spin('seconds',.05,120,3,2))
+        f.addRow('窗口帧数',self.spin('window_frames',1,100000,30,0))
         f.addRow('运算方式',self.combo('mode',[('关闭叠加 · 单帧','关闭'),('滚动帧平均','平均'),('滚动帧积分','积分')]))
+        f.addRow('亮度触发条件',self.combo('trigger_condition',[(s,s) for s in ['关闭','平均亮度低于','平均亮度高于']]))
+        f.addRow('触发阈值 / %',self.spin('trigger_threshold',0,100,20,1))
+        f.addRow('触发后切换为',self.combo('trigger_mode',[('滚动帧平均','平均'),('滚动帧积分','积分'),('关闭叠加 · 单帧','关闭')]))
         budget=self.spin('memory',0,65536,0,0);budget.setSpecialValueText('自动 · 按可用内存扩展')
         budget.setToolTip('0 为自动扩展，并给系统保留可用内存；大于0为手动硬上限。不会丢弃窗口内的帧。')
         f.addRow('缓存 / MB（0=自动）',budget)
         f.addRow(self.button('应用自动曝光 / 叠加',self.apply_processing,True))
-        note=QLabel('选择后立即生效。平均／积分切换保留当前窗口；亮度按当前曝光显示。');note.setWordWrap(True);f.addRow(note)
+        note=QLabel('窗口可按时间或帧数限制；改变单位、时长或帧数后从下一帧重新计数。触发器使用当前窗口全部帧的平均亮度，达到条件时切换到指定模式。');note.setWordWrap(True);f.addRow(note)
         lay.addStretch()
         lay=self.page(tabs,'校正 / 显示')
         f=self.group('校正主帧',lay)
@@ -414,6 +420,7 @@ class MainWindow(QMainWindow):
             c.blockSignals(False)
         if hasattr(self,'preview'):self.refresh_regions()
         if hasattr(self,'curve_widget'):self.refresh_curve()
+        if hasattr(self,'controls') and 'window_unit' in self.controls:self.refresh_window_controls()
     def choose_dll(self):
         filename=BACKENDS[self.backend.currentData()][1]
         p,_=QFileDialog.getOpenFileName(self,'选择官方 x64 相机接口','',f'接口文件 ({filename})')
@@ -426,10 +433,10 @@ class MainWindow(QMainWindow):
         if self.connected:self.worker.send('disconnect')
         else:self.worker.send('connect',sim=self.source.currentIndex()==1,backend=self.backend.currentData(),dll=self.dll.text(),index=self.index.value())
     def apply_capture(self):
-        v=self.values(['exposure','gain','resolution','native_bin','software_bin']);v={k:x for k,x in v.items() if x is not None}
+        v=self.values(['exposure','gain','input_bits','resolution','native_bin','software_bin']);v={k:x for k,x in v.items() if x is not None}
         self.worker.send('settings',values=v)
     def apply_processing(self):
-        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','seconds','mode','memory','dark','bias','flat'])
+        v=self.values(['ae_mode','target','ae_low','ae_high','ae_gain_low','ae_gain_high','seconds','window_unit','window_frames','mode','memory','trigger_condition','trigger_threshold','trigger_mode','dark','bias','flat'])
         if v['ae_low']>v['ae_high']:self.show_error('最短曝光不能大于最长曝光');return
         self.worker.send('settings',values=v)
     def apply_display(self):
@@ -451,6 +458,13 @@ class MainWindow(QMainWindow):
         mode=self.controls['curve_mode'].currentData();self.curve_widget.set_curve(mode,p,self.advanced['curve_points'])
         active=mode=='Camera Raw 参数曲线'
         for k in ('curve_shadows','curve_darks','curve_lights','curve_highlights'):self.controls[k].setEnabled(active)
+    def refresh_window_controls(self):
+        if 'window_unit' not in self.controls:return
+        frame_mode=self.controls['window_unit'].currentData()=='帧数'
+        self.controls['window_frames'].setEnabled(frame_mode)
+        self.controls['seconds'].setEnabled(not frame_mode)
+        active=self.controls['trigger_condition'].currentData()!='关闭'
+        for k in ('trigger_threshold','trigger_mode'):self.controls[k].setEnabled(active)
     def capture_master(self,kind):
         if not self.connected:self.show_error('请先连接相机');return
         if self.source.currentIndex()==0:
@@ -462,12 +476,12 @@ class MainWindow(QMainWindow):
         p,_=fn(self,'校正库','','校正库 (*.npz)')
         if p:self.worker.send('library_save' if save else 'library_load',path=p)
     def save_image(self):
-        options={'原始16位 TIFF (*.tif)':'raw','处理后浮点 TIFF (*.tif)':'float','处理后 FITS (*.fits)':'fits','预览 PNG (*.png)':'png'}
+        options={'原始 TIFF（16位容器） (*.tif)':'raw','处理后浮点 TIFF (*.tif)':'float','处理后 FITS (*.fits)':'fits','预览 PNG (*.png)':'png'}
         p,f=QFileDialog.getSaveFileName(self,'保存当前完整图像','',';;'.join(options))
         if p:self.worker.send('save',path=p,format=options[f])
     def record(self):
         if self.recording:self.worker.send('record');return
-        p,_=QFileDialog.getSaveFileName(self,'保存16位原始视频','','SER (*.ser)')
+        p,_=QFileDialog.getSaveFileName(self,'保存原始视频（16位容器）','','SER (*.ser)')
         if p:self.worker.send('record',path=p)
     def save_config(self):
         p,_=QFileDialog.getSaveFileName(self,'保存配置','','JSON (*.json)')
@@ -544,17 +558,17 @@ class MainWindow(QMainWindow):
                     self.controls[k].setRange(r[0],r[1]);self.controls[k].setSingleStep(max(.001,r[2]))
                 for k in ('ae_low','ae_high'):self.controls[k].setRange(e['exp_range'][0],e['exp_range'][1])
                 for k in ('ae_gain_low','ae_gain_high'):self.controls[k].setRange(e['gain_range'][0],e['gain_range'][1])
-                for k,opts in [('resolution',e['resolutions']),('native_bin',e['bins'])]:
+                for k,opts in [('resolution',e['resolutions']),('native_bin',e['bins']),('input_bits',e.get('bit_options',[]))]:
                     c=self.controls[k];c.blockSignals(True);c.clear()
                     for v,t in opts:c.addItem(t,v)
                     if not opts:c.addItem('驱动未提供',None)
-                    c.setEnabled(bool(opts))
+                    c.setEnabled(bool(opts) and (k!='input_bits' or len(opts)>1))
                     c.blockSignals(False)
                 self.set_values(e)
                 self.log.appendPlainText('已连接：'+e['name']);self.output.message=''
             elif kind=='disconnected':
                 self.connected=False;self.connect_btn.setText('连接相机');self.live_label.setText('未连接');self.output.message='未连接相机';self.output.update()
-                self.source.setEnabled(True);self.index.setEnabled(True);self.backend.setEnabled(True);self.dll.setEnabled(True);self.output.pix=QPixmap()
+                self.source.setEnabled(True);self.index.setEnabled(True);self.backend.setEnabled(True);self.dll.setEnabled(True);self.controls['input_bits'].setEnabled(True);self.output.pix=QPixmap()
             elif kind=='settings':self.set_values(e['values'])
             elif kind=='telemetry':
                 self.set_values({k:v for k,v in e['values'].items() if k in self.controls and not self.controls[k].hasFocus()})
@@ -576,11 +590,14 @@ class MainWindow(QMainWindow):
             if not self.worker.paused and not self.master_active:self.output.message='模拟画面 · 非相机数据' if d['sim'] else ''
             self.output.update()
             self.hist.counts=d['counts'];self.hist.low=d['hist_low'];self.hist.high=d['hist_high'];self.hist.update();s=d['stats']
-            mode_text='单帧' if d['mode']=='关闭' else '滚动'+d['mode']
+            mode_text='单帧' if d.get('effective_mode',d['mode'])=='关闭' else '滚动'+d.get('effective_mode',d['mode'])
+            configured_text='单帧' if d['mode']=='关闭' else '滚动'+d['mode']
             self.live_label.setText(('模拟预览' if d['sim'] else '实际采集')+f"   ·   {d['shape'][1]} × {d['shape'][0]}   ·   {self.fps:.1f} 帧/秒   ·   {mode_text}")
             ae=d['ae_mode'];stretch='持续自动' if d['stretch'] else '固定'
-            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op'])
-            self.stats.setText(f"接口输出 {d['bits']} 位 · 16 位存储容器\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}\n窗口缓存  {d['frames']} 帧\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")
+            self.capture_state.setText('测光控制：'+d['ae_status']+'  ·  像素运算：'+d['math_op']+'  ·  亮度触发：'+d.get('trigger_state','未启用'))
+            trigger_line='' if configured_text==mode_text else f"\n设置模式  {configured_text}"
+            overflow='；滚动积分超过原始范围属于浮点累加' if d.get('processed_overflow') and d.get('effective_mode')=='积分' else ''
+            self.stats.setText(f"原始帧 Mono{d['bits']} · 有效范围 0—{d['raw_limit']} · 16 位容器\n原始均值  {d['raw_mean']:.1f} · 原始峰值  {d['raw_max']:.1f}\n曝光读回  {d['exposure']:.3f} ms\n增益读回  {d['gain']:g}\n自动曝光  {ae}\n显示拉伸  {stretch}\n\n生效模式  {mode_text}{trigger_line}\n窗口缓存  {d['frames']} 帧（{('时间' if d['window_unit']=='时间' else '帧数')}）\n首末跨度  {d['span']:.2f} 秒\n缓存合计  {d['memory']:.0f} MB\n处理尺寸  {d['processed_shape'][1]}×{d['processed_shape'][0]}\n处理类型  {d['processed_dtype']}{overflow}\n\n处理均值  {s['mean']:.1f}\n超过亮点  {s['white_clip']:.3f}%\n对焦参考  {s['focus']:.1f}\n\n当前暗点  {d['black']:.1f}\n当前亮点  {d['white']:.1f}")
         if self.connected and self.last_stamp and not self.worker.paused and not self.master_active:
             elapsed=time.monotonic()-self.last_stamp
             expected=max(2.,self.controls['exposure'].value()/1000*3+1)

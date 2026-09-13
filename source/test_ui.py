@@ -93,3 +93,18 @@ def test_normal_wait_does_not_black_out_obs():
         assert not w.output.pix.isNull() and '暂无' not in w.output.message
     finally:
         w.worker.send('quit');pump(app,lambda:not w.worker.is_alive());w.close();app.processEvents()
+
+def test_bit_depth_frame_window_and_brightness_trigger():
+    app=QApplication.instance() or QApplication([]);w=MainWindow();w.show()
+    try:
+        w.source.setCurrentIndex(1);w.connect_camera();pump(app,lambda:w.latest is not None)
+        bits=w.controls['input_bits'];bits.setCurrentIndex(bits.findData(14));bits.activated.emit(bits.currentIndex())
+        pump(app,lambda:w.latest is not None and w.latest['bits']==14)
+        unit=w.controls['window_unit'];unit.setCurrentIndex(unit.findData('帧数'));unit.activated.emit(unit.currentIndex())
+        w.controls['window_frames'].setValue(4);w.apply_processing()
+        pump(app,lambda:w.worker.settings['window_unit']=='帧数' and w.worker.settings['window_frames']==4)
+        w.worker.send('settings',values={'mode':'关闭','trigger_condition':'平均亮度高于','trigger_threshold':0,'trigger_mode':'积分'})
+        pump(app,lambda:w.latest is not None and w.latest['effective_mode']=='积分')
+        assert w.latest['frames']<=4 and w.latest['raw_limit']==16383
+    finally:
+        w.worker.send('quit');pump(app,lambda:not w.worker.is_alive());w.close();app.processEvents()

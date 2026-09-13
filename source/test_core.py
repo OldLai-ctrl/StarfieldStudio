@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 import tifffile
 from core import *
-from camera import Frame, decode_frame
+from camera import Frame, decode_frame, SimCamera
+from camera_common import validate_native_frame
 from worker import CaptureWorker
 
 def test_exact_rolling_window():
@@ -17,6 +18,15 @@ def test_exact_rolling_window():
     r.push(np.full((2,3),7),9);assert len(r.frames)==1
     np.testing.assert_allclose(r.result(),7)
     with pytest.raises(ValueError):r.push(np.zeros((2,3)),9)
+
+def test_frame_count_window_keeps_exact_latest_frames():
+    r=RollingIntegrator(window_unit='帧数',frame_limit=3,memory_mb=16)
+    for i in range(6):r.push(np.full((2,2),i,np.float32),i)
+    assert [int(a[0,0]) for _,a in r.frames]==[3,4,5]
+    np.testing.assert_allclose(r.result('平均'),4)
+    r.set_window('时间',seconds=2,frames=3);r.clear()
+    for t in (0,.5,2.5):r.push(np.ones((1,1)),t)
+    assert len(r.frames)==1
 
 def test_memory_budget_no_silent_window_shortening():
     r=RollingIntegrator(10,memory_mb=.001)
@@ -98,6 +108,16 @@ def test_raw_offset_padding_and_reject_8bit():
     f.depth=2;f.format=0x10
     with pytest.raises(RuntimeError):decode_frame(f)
     np.testing.assert_equal(decode_frame(f,16),a)
+    b=(C.c_uint8*32)();g=Frame();g.header=8;g.offset=8;g.width=3;g.height=2;g.stride=4;g.depth=8;g.format=0x10;g.element=1;g.channels=1;g.buffer=C.addressof(b)
+    np.ndarray((2,3),dtype=np.uint8,buffer=b,offset=8,strides=(4,1))[:]=[[0,127,255],[4,8,16]]
+    np.testing.assert_equal(decode_frame(g,8),[[0,127,255],[4,8,16]])
+    with pytest.raises(RuntimeError,match='超过'):
+        validate_native_frame(np.array([[4096]],np.uint16),12)
+
+def test_simulator_exposes_switchable_input_bits():
+    c=SimCamera();c.configure(input_bits=14);a=c.read()
+    assert c.input_bits==c.meta.bits==14 and int(a.max())<=16383
+    c.configure(input_bits=8);a=c.read();assert int(a.max())<=255
     assert C.sizeof(Frame)==56
 
 def test_ser_and_fits_readback(tmp_path):
